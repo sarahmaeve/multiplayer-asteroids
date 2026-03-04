@@ -1,0 +1,11 @@
+[package]
+name = "shared"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+tokio = { version = "1", features = ["io-util"] }
+anyhow = "1"
+log = "0.4"
