@@ -980,12 +980,14 @@ fn draw_entities(state: &RenderState, snapshot: &GameStateSnapshot, textures: &S
                 );
             }
             EntityKind::Asteroid => {
+                // vx encodes the asteroid's collision radius (big=60, small=30).
+                let radius = if entity.vx > 0.0 { entity.vx } else { 30.0 };
+                let draw_size = radius * 2.0;
                 if let Some(tex) = &obj_textures.asteroid {
-                    let draw_size = 44.0; // matches game collision radius of 22
                     draw_texture_ex(tex, entity.x - draw_size / 2.0, entity.y - draw_size / 2.0,
                         WHITE, DrawTextureParams { dest_size: Some(vec2(draw_size, draw_size)), ..Default::default() });
                 } else {
-                    draw_poly_lines(entity.x, entity.y, 6, 22.0, 0.0, 2.0, GRAY);
+                    draw_poly_lines(entity.x, entity.y, 6, radius, entity.angle, 2.0, GRAY);
                 }
             }
             EntityKind::Planet => {
@@ -1396,6 +1398,17 @@ fn draw_minimap(state: &RenderState, snapshot: &GameStateSnapshot) {
         let tw = measure_text(abbr, None, fs as u16, 1.0).width;
         draw_text(abbr, mx - tw / 2.0, my + 5.0 + fs,
             fs, Color::new(0.80, 0.88, 1.0, 0.88));
+    }
+
+    // ── Big asteroids ─────────────────────────────────────────────────────────
+    for entity in &snapshot.entities {
+        if entity.kind != EntityKind::Asteroid { continue; }
+        if entity.vx < 50.0 { continue; } // only big asteroids (radius ~60)
+        let (mx, my) = to_map(entity.x, entity.y);
+        let fs = 9.0;
+        let tm = measure_text("#", None, fs as u16, 1.0);
+        draw_text("#", mx - tm.width / 2.0, my + tm.height / 2.0, fs,
+            Color::new(1.0, 0.55, 0.0, 0.85));
     }
 
     // ── Ships ─────────────────────────────────────────────────────────────────

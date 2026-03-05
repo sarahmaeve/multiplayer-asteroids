@@ -45,8 +45,11 @@ pub enum GameEvent {
 /// Torpedo detonation radius: ¼ of a Scout's render size (10.0 / 4.0).
 const TORPEDO_RADIUS: f32 = 2.5;
 
-/// Collision radius used for asteroid–projectile and asteroid–phaser checks.
-const ASTEROID_RADIUS: f32 = 30.0;
+/// Collision radius and health for each asteroid size tier.
+const BIG_ASTEROID_RADIUS: f32 = 60.0;
+const SMALL_ASTEROID_RADIUS: f32 = 30.0;
+const BIG_ASTEROID_HEALTH: f32 = 500.0;
+const SMALL_ASTEROID_HEALTH: f32 = 200.0;
 
 /// What a phaser beam hit on its way to the target.
 #[derive(Debug)]
@@ -70,6 +73,9 @@ struct ServerEntity {
     damage: f32,
     /// Hit points for destructible objects (asteroids).  `None` = indestructible.
     health: Option<f32>,
+    /// Visual/collision radius for asteroids (`BIG_ASTEROID_RADIUS` or `SMALL_ASTEROID_RADIUS`).
+    /// `None` for non-asteroid entities.
+    asteroid_radius: Option<f32>,
     /// Remaining lifetime in seconds; `None` = permanent.
     lifetime: Option<f32>,
     /// Remaining travel distance in world units; `None` = no distance limit.
@@ -165,6 +171,7 @@ impl GameState {
                 owner: Some(player_id),
                 damage: 0.0,
                 health: None,
+                asteroid_radius: None,
                 lifetime: None,
                 travel_remaining: None,
             },
@@ -189,6 +196,7 @@ impl GameState {
                 owner: None,
                 damage: 0.0,
                 health: None,
+                asteroid_radius: None,
                 lifetime: Some(EXPLOSION_LIFETIME),
                 travel_remaining: None,
             },
@@ -216,6 +224,7 @@ impl GameState {
                     owner: None,
                     damage: spin, // repurposed: angular velocity (rad/s)
                     health: None,
+                    asteroid_radius: None,
                     lifetime: Some(5.0),
                     travel_remaining: None,
                 },
@@ -240,7 +249,8 @@ impl GameState {
                     angle: rng.gen_range(0.0..std::f32::consts::TAU),
                     owner: None,
                     damage: 50.0,
-                    health: Some(500.0),
+                    health: Some(BIG_ASTEROID_HEALTH),
+                    asteroid_radius: Some(BIG_ASTEROID_RADIUS),
                     lifetime: None,
                     travel_remaining: None,
                 },
@@ -271,11 +281,64 @@ impl GameState {
                     owner: None,
                     damage: 0.0,
                     health: None,
+                    asteroid_radius: None,
                     lifetime: None,
                     travel_remaining: None,
                 },
             );
         }
+    }
+
+    // ── Asteroid helpers ──────────────────────────────────────────────────────
+
+    fn spawn_big_asteroid(&mut self) {
+        let mut rng = rand::thread_rng();
+        let id = self.alloc_entity_id();
+        let drift_angle = rng.gen_range(0.0..std::f32::consts::TAU);
+        let drift_speed = rng.gen_range(10.0..40.0f32);
+        self.entities.insert(
+            id,
+            ServerEntity {
+                id,
+                kind: EntityKind::Asteroid,
+                x: rng.gen_range(500.0..WORLD_WIDTH - 500.0),
+                y: rng.gen_range(500.0..WORLD_HEIGHT - 500.0),
+                vx: drift_angle.cos() * drift_speed,
+                vy: drift_angle.sin() * drift_speed,
+                angle: rng.gen_range(0.0..std::f32::consts::TAU),
+                owner: None,
+                damage: 50.0,
+                health: Some(BIG_ASTEROID_HEALTH),
+                asteroid_radius: Some(BIG_ASTEROID_RADIUS),
+                lifetime: None,
+                travel_remaining: None,
+            },
+        );
+    }
+
+    fn spawn_small_asteroid(&mut self, x: f32, y: f32) {
+        let mut rng = rand::thread_rng();
+        let id = self.alloc_entity_id();
+        let drift_angle = rng.gen_range(0.0..std::f32::consts::TAU);
+        let drift_speed = rng.gen_range(30.0..80.0f32);
+        self.entities.insert(
+            id,
+            ServerEntity {
+                id,
+                kind: EntityKind::Asteroid,
+                x,
+                y,
+                vx: drift_angle.cos() * drift_speed,
+                vy: drift_angle.sin() * drift_speed,
+                angle: rng.gen_range(0.0..std::f32::consts::TAU),
+                owner: None,
+                damage: 25.0,
+                health: Some(SMALL_ASTEROID_HEALTH),
+                asteroid_radius: Some(SMALL_ASTEROID_RADIUS),
+                lifetime: None,
+                travel_remaining: None,
+            },
+        );
     }
 
     // ── Event processing ──────────────────────────────────────────────────────
@@ -447,6 +510,16 @@ impl GameState {
 
         for (x, y) in range_expired {
             self.spawn_explosion(x, y);
+        }
+
+        // Replenish big asteroids: spawn one when fewer than 5 remain, up to a cap of 15.
+        let big_count = self
+            .entities
+            .values()
+            .filter(|e| e.asteroid_radius == Some(BIG_ASTEROID_RADIUS))
+            .count();
+        if big_count < 5 && big_count < 15 {
+            self.spawn_big_asteroid();
         }
 
         self.check_collisions();
@@ -667,6 +740,7 @@ impl GameState {
                         owner: Some(pid),
                         damage: 0.0,
                         health: None,
+                        asteroid_radius: None,
                         lifetime: None,
                         travel_remaining: None,
                     },
@@ -727,6 +801,7 @@ impl GameState {
                     owner: Some(pid),
                     damage: stats.primary_damage,
                     health: None,
+                    asteroid_radius: None,
                     lifetime: None,
                     travel_remaining: Some(max_travel),
                 },
@@ -777,13 +852,14 @@ impl GameState {
         }
 
         // Check asteroids (beam stops at the closer of ship or asteroid).
-        for e in self.entities.values().filter(|e| e.kind == EntityKind::Asteroid) {
+        for e in self.entities.values().filter(|e| e.kind == EntityKind::Asteroid && e.health.is_some()) {
+            let ar = e.asteroid_radius.unwrap_or(SMALL_ASTEROID_RADIUS);
             let rx = e.x - ox;
             let ry = e.y - oy;
             let proj = rx * dx + ry * dy;
             if proj <= 0.0 || proj > range { continue; }
             let perp = (rx * dy - ry * dx).abs();
-            if perp < BEAM_HALF_WIDTH && proj < closest_dist {
+            if perp < ar && proj < closest_dist {
                 closest_dist = proj;
                 hit = Some(PhaserHit::Asteroid(e.id));
             }
@@ -839,13 +915,15 @@ impl GameState {
         }
     }
 
-    /// Apply `damage` to an asteroid, destroying it if health reaches zero.
-    /// Credits `scorer` with 5 points on destruction.
+    /// Apply `damage` to an asteroid.
+    ///
+    /// Big asteroids split into 1–4 small ones when health first drops below 50%,
+    /// awarding `scorer` 3 points.  Small asteroids are destroyed at 0 HP for 1 point.
     fn apply_asteroid_damage(&mut self, asteroid_id: EntityId, dmg: f32, scorer: Option<PlayerId>) {
-        let result = if let Some(e) = self.entities.get_mut(&asteroid_id) {
+        let outcome = if let Some(e) = self.entities.get_mut(&asteroid_id) {
             if let Some(ref mut h) = e.health {
                 *h -= dmg;
-                if *h <= 0.0 { Some((e.x, e.y)) } else { None }
+                Some((*h, e.x, e.y, e.asteroid_radius))
             } else {
                 None
             }
@@ -853,12 +931,30 @@ impl GameState {
             None
         };
 
-        if let Some((x, y)) = result {
+        let Some((health_after, x, y, radius)) = outcome else { return };
+
+        let is_big = radius == Some(BIG_ASTEROID_RADIUS);
+
+        if is_big && health_after < BIG_ASTEROID_HEALTH * 0.5 {
+            // Big asteroid splits.
+            self.entities.remove(&asteroid_id);
+            self.spawn_explosion(x, y);
+            let num_children = rand::thread_rng().gen_range(1..=4u32);
+            for _ in 0..num_children {
+                self.spawn_small_asteroid(x, y);
+            }
+            if let Some(pid) = scorer {
+                if let Some(p) = self.players.get_mut(&pid) {
+                    p.score += 3;
+                }
+            }
+        } else if health_after <= 0.0 {
+            // Small asteroid destroyed.
             self.entities.remove(&asteroid_id);
             self.spawn_explosion(x, y);
             if let Some(pid) = scorer {
                 if let Some(p) = self.players.get_mut(&pid) {
-                    p.score += 5;
+                    p.score += 1;
                 }
             }
         }
@@ -981,15 +1077,14 @@ impl GameState {
             }
         }
 
-        // Snapshot asteroid positions for torpedo collision.
-        let asteroids: Vec<(EntityId, f32, f32)> = self
+        // Snapshot asteroid positions for torpedo collision; include per-entity radius.
+        let asteroids: Vec<(EntityId, f32, f32, f32)> = self
             .entities
             .values()
             .filter(|e| e.kind == EntityKind::Asteroid && e.health.is_some())
-            .map(|e| (e.id, e.x, e.y))
+            .map(|e| (e.id, e.x, e.y, e.asteroid_radius.unwrap_or(SMALL_ASTEROID_RADIUS)))
             .collect();
 
-        let asteroid_dist_sq = (ASTEROID_RADIUS + TORPEDO_RADIUS) * (ASTEROID_RADIUS + TORPEDO_RADIUS);
         // (asteroid_id, damage, scorer)
         let mut asteroid_damage_events: Vec<(EntityId, f32, Option<PlayerId>)> = Vec::new();
 
@@ -997,10 +1092,11 @@ impl GameState {
             if hit_projectiles.contains(pid) {
                 continue;
             }
-            for &(asteroid_id, ax, ay) in &asteroids {
+            for &(asteroid_id, ax, ay, ar) in &asteroids {
                 let dx = px - ax;
                 let dy = py - ay;
-                if dx * dx + dy * dy < asteroid_dist_sq {
+                let dist_sq_threshold = (ar + TORPEDO_RADIUS) * (ar + TORPEDO_RADIUS);
+                if dx * dx + dy * dy < dist_sq_threshold {
                     hit_projectiles.insert(*pid);
                     hit_details.push((*pid, *px, *py, *pkind == EntityKind::Torpedo));
                     asteroid_damage_events.push((asteroid_id, *dmg, *owner));
@@ -1143,7 +1239,13 @@ impl GameState {
                     kind: e.kind,
                     x: e.x,
                     y: e.y,
-                    vx: e.vx,
+                    // For Asteroid entities: vx carries the visual/collision radius so
+                    // the client can scale rendering correctly.
+                    vx: if e.kind == EntityKind::Asteroid {
+                        e.asteroid_radius.unwrap_or(SMALL_ASTEROID_RADIUS)
+                    } else {
+                        e.vx
+                    },
                     // For Explosion entities: vy carries remaining lifetime so the
                     // client can compute animation progress as t = 1 − vy/vx.
                     vy: if e.kind == EntityKind::Explosion {
