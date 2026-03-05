@@ -1434,14 +1434,14 @@ fn draw_scoreboard(state: &RenderState) {
     y += 18.0;
 
     let mut sorted = state.scores.clone();
-    sorted.sort_by(|a, b| b.kills.cmp(&a.kills));
+    sorted.sort_by(|a, b| b.score.cmp(&a.score).then(b.kills.cmp(&a.kills)));
 
     for score in &sorted {
         let is_me = state.my_player_id == Some(score.player_id);
         let color = if is_me { GREEN } else { LIGHTGRAY };
         let status = if score.alive { "" } else { " (dead)" };
         draw_text(
-            &format!("{} {}/{}{status}", score.username, score.kills, score.deaths),
+            &format!("{} {}/{} pts:{}{status}", score.username, score.kills, score.deaths, score.score),
             x, y, 13.0, color,
         );
         y += 16.0;

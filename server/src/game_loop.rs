@@ -45,6 +45,16 @@ pub enum GameEvent {
 /// Torpedo detonation radius: ¼ of a Scout's render size (10.0 / 4.0).
 const TORPEDO_RADIUS: f32 = 2.5;
 
+/// Collision radius used for asteroid–projectile and asteroid–phaser checks.
+const ASTEROID_RADIUS: f32 = 30.0;
+
+/// What a phaser beam hit on its way to the target.
+#[derive(Debug)]
+enum PhaserHit {
+    Ship(PlayerId),
+    Asteroid(EntityId),
+}
+
 // ─── Server-side entity ───────────────────────────────────────────────────────
 
 struct ServerEntity {
@@ -58,6 +68,8 @@ struct ServerEntity {
     owner: Option<PlayerId>,
     /// Damage inflicted on a ship hit (zero for static objects).
     damage: f32,
+    /// Hit points for destructible objects (asteroids).  `None` = indestructible.
+    health: Option<f32>,
     /// Remaining lifetime in seconds; `None` = permanent.
     lifetime: Option<f32>,
     /// Remaining travel distance in world units; `None` = no distance limit.
@@ -100,6 +112,8 @@ struct ServerPlayer {
     torpedo_count: u8,
     /// Accumulates time (seconds) toward the next torpedo replenishment.
     torpedo_regen_timer: f32,
+    /// Points earned (5 per asteroid destroyed).
+    score: u32,
     /// Sticky flag: set to `true` when the client sends `fire_primary = true`.
     /// Consumed (cleared) once the torpedo is actually launched.  This ensures
     /// a keypress that arrives between server ticks is not silently lost.
@@ -150,6 +164,7 @@ impl GameState {
                 angle: rng.gen_range(0.0..std::f32::consts::TAU),
                 owner: Some(player_id),
                 damage: 0.0,
+                health: None,
                 lifetime: None,
                 travel_remaining: None,
             },
@@ -173,6 +188,7 @@ impl GameState {
                 angle: 0.0,
                 owner: None,
                 damage: 0.0,
+                health: None,
                 lifetime: Some(EXPLOSION_LIFETIME),
                 travel_remaining: None,
             },
@@ -199,6 +215,7 @@ impl GameState {
                     angle: rng.gen_range(0.0..std::f32::consts::TAU),
                     owner: None,
                     damage: spin, // repurposed: angular velocity (rad/s)
+                    health: None,
                     lifetime: Some(5.0),
                     travel_remaining: None,
                 },
@@ -209,6 +226,8 @@ impl GameState {
     fn spawn_static_objects(&mut self) {
         let mut rng = rand::thread_rng();
         for i in 0..20u32 {
+            let drift_angle = rng.gen_range(0.0..std::f32::consts::TAU);
+            let drift_speed = rng.gen_range(10.0..40.0f32);
             self.entities.insert(
                 i,
                 ServerEntity {
@@ -216,11 +235,12 @@ impl GameState {
                     kind: EntityKind::Asteroid,
                     x: rng.gen_range(500.0..WORLD_WIDTH - 500.0),
                     y: rng.gen_range(500.0..WORLD_HEIGHT - 500.0),
-                    vx: 0.0,
-                    vy: 0.0,
-                    angle: 0.0,
+                    vx: drift_angle.cos() * drift_speed,
+                    vy: drift_angle.sin() * drift_speed,
+                    angle: rng.gen_range(0.0..std::f32::consts::TAU),
                     owner: None,
                     damage: 50.0,
+                    health: Some(500.0),
                     lifetime: None,
                     travel_remaining: None,
                 },
@@ -250,6 +270,7 @@ impl GameState {
                     angle: 0.0,
                     owner: None,
                     damage: 0.0,
+                    health: None,
                     lifetime: None,
                     travel_remaining: None,
                 },
@@ -288,6 +309,7 @@ impl GameState {
                         torpedo_count: 6,
                         torpedo_regen_timer: 0.0,
                         pending_torpedo_fire: false,
+                        score: 0,
                     },
                 );
             }
@@ -399,6 +421,9 @@ impl GameState {
                 let drag = 0.98f32.powf(dt * 20.0);
                 entity.vx *= drag;
                 entity.vy *= drag;
+            } else if entity.kind == EntityKind::Asteroid {
+                entity.x = (entity.x + entity.vx * dt).rem_euclid(WORLD_WIDTH);
+                entity.y = (entity.y + entity.vy * dt).rem_euclid(WORLD_HEIGHT);
             }
         }
 
@@ -641,6 +666,7 @@ impl GameState {
                         angle: beam_dir,
                         owner: Some(pid),
                         damage: 0.0,
+                        health: None,
                         lifetime: None,
                         travel_remaining: None,
                     },
@@ -652,8 +678,14 @@ impl GameState {
             if should_fire_phaser {
                 self.players.get_mut(&pid).unwrap().phaser_cooldown =
                     1.0 / stats.phaser_fire_rate_hz;
-                if let Some((victim_id, dmg)) = hit {
-                    self.apply_damage(victim_id, dmg, Some(pid), false);
+                match hit {
+                    Some((PhaserHit::Ship(victim_id), dmg)) => {
+                        self.apply_damage(victim_id, dmg, Some(pid), false);
+                    }
+                    Some((PhaserHit::Asteroid(eid), dmg)) => {
+                        self.apply_asteroid_damage(eid, dmg, Some(pid));
+                    }
+                    None => {}
                 }
             }
         } else {
@@ -694,6 +726,7 @@ impl GameState {
                     angle: fire_angle,
                     owner: Some(pid),
                     damage: stats.primary_damage,
+                    health: None,
                     lifetime: None,
                     travel_remaining: Some(max_travel),
                 },
@@ -704,8 +737,8 @@ impl GameState {
 
     /// Cast a phaser ray from `(ox, oy)` in direction `angle`.
     ///
-    /// Returns `(beam_length, Option<(victim_id, damage)>)`.
-    /// The beam stops at the first ship it hits within `range`.
+    /// Returns `(beam_length, Option<(PhaserHit, damage)>)`.
+    /// The beam stops at the first ship or asteroid it hits within `range`.
     fn cast_phaser_ray(
         &self,
         ox: f32,
@@ -713,54 +746,50 @@ impl GameState {
         angle: f32,
         range: f32,
         shooter: PlayerId,
-    ) -> (f32, Option<(PlayerId, f32)>) {
+    ) -> (f32, Option<(PhaserHit, f32)>) {
         const BEAM_HALF_WIDTH: f32 = 16.0;
 
         let dx = angle.cos();
         let dy = angle.sin();
 
-        // Snapshot enemy ship positions.
-        let targets: Vec<(PlayerId, f32, f32)> = self
-            .entities
-            .values()
-            .filter(|e| e.kind == EntityKind::Ship)
-            .filter_map(|e| {
-                let owner = e.owner?;
-                if owner == shooter { return None; }
-                Some((owner, e.x, e.y))
-            })
-            .collect();
+        let phaser_damage = self
+            .players
+            .get(&shooter)
+            .map(|p| p.ship_class.stats().phaser_damage)
+            .unwrap_or(0.0);
 
         let mut closest_dist = range;
-        let mut hit_target: Option<PlayerId> = None;
+        let mut hit: Option<PhaserHit> = None;
 
-        for (target_pid, tx, ty) in &targets {
-            let rx = tx - ox;
-            let ry = ty - oy;
-            // Projection onto beam axis.
+        // Check enemy ships.
+        for e in self.entities.values().filter(|e| e.kind == EntityKind::Ship) {
+            let Some(owner) = e.owner else { continue };
+            if owner == shooter { continue; }
+            let rx = e.x - ox;
+            let ry = e.y - oy;
             let proj = rx * dx + ry * dy;
-            if proj <= 0.0 || proj > range {
-                continue;
-            }
-            // Perpendicular distance from beam centre-line.
+            if proj <= 0.0 || proj > range { continue; }
             let perp = (rx * dy - ry * dx).abs();
             if perp < BEAM_HALF_WIDTH && proj < closest_dist {
                 closest_dist = proj;
-                hit_target = Some(*target_pid);
+                hit = Some(PhaserHit::Ship(owner));
             }
         }
 
-        let damage = if hit_target.is_some() {
-            // Retrieve phaser_damage from the shooter's ship class.
-            self.players
-                .get(&shooter)
-                .map(|p| p.ship_class.stats().phaser_damage)
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        };
+        // Check asteroids (beam stops at the closer of ship or asteroid).
+        for e in self.entities.values().filter(|e| e.kind == EntityKind::Asteroid) {
+            let rx = e.x - ox;
+            let ry = e.y - oy;
+            let proj = rx * dx + ry * dy;
+            if proj <= 0.0 || proj > range { continue; }
+            let perp = (rx * dy - ry * dx).abs();
+            if perp < BEAM_HALF_WIDTH && proj < closest_dist {
+                closest_dist = proj;
+                hit = Some(PhaserHit::Asteroid(e.id));
+            }
+        }
 
-        (closest_dist, hit_target.map(|id| (id, damage)))
+        (closest_dist, hit.map(|h| (h, phaser_damage)))
     }
 
     /// Apply `damage` to `victim`, crediting `killer` on death.
@@ -807,6 +836,31 @@ impl GameState {
 
         if is_dead {
             self.kill_player(victim_id, killer_id, self_destruct);
+        }
+    }
+
+    /// Apply `damage` to an asteroid, destroying it if health reaches zero.
+    /// Credits `scorer` with 5 points on destruction.
+    fn apply_asteroid_damage(&mut self, asteroid_id: EntityId, dmg: f32, scorer: Option<PlayerId>) {
+        let result = if let Some(e) = self.entities.get_mut(&asteroid_id) {
+            if let Some(ref mut h) = e.health {
+                *h -= dmg;
+                if *h <= 0.0 { Some((e.x, e.y)) } else { None }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some((x, y)) = result {
+            self.entities.remove(&asteroid_id);
+            self.spawn_explosion(x, y);
+            if let Some(pid) = scorer {
+                if let Some(p) = self.players.get_mut(&pid) {
+                    p.score += 5;
+                }
+            }
         }
     }
 
@@ -927,6 +981,34 @@ impl GameState {
             }
         }
 
+        // Snapshot asteroid positions for torpedo collision.
+        let asteroids: Vec<(EntityId, f32, f32)> = self
+            .entities
+            .values()
+            .filter(|e| e.kind == EntityKind::Asteroid && e.health.is_some())
+            .map(|e| (e.id, e.x, e.y))
+            .collect();
+
+        let asteroid_dist_sq = (ASTEROID_RADIUS + TORPEDO_RADIUS) * (ASTEROID_RADIUS + TORPEDO_RADIUS);
+        // (asteroid_id, damage, scorer)
+        let mut asteroid_damage_events: Vec<(EntityId, f32, Option<PlayerId>)> = Vec::new();
+
+        for (pid, pkind, px, py, owner, dmg) in &projectiles {
+            if hit_projectiles.contains(pid) {
+                continue;
+            }
+            for &(asteroid_id, ax, ay) in &asteroids {
+                let dx = px - ax;
+                let dy = py - ay;
+                if dx * dx + dy * dy < asteroid_dist_sq {
+                    hit_projectiles.insert(*pid);
+                    hit_details.push((*pid, *px, *py, *pkind == EntityKind::Torpedo));
+                    asteroid_damage_events.push((asteroid_id, *dmg, *owner));
+                    break;
+                }
+            }
+        }
+
         for (id, x, y, is_torpedo) in hit_details {
             self.entities.remove(&id);
             if is_torpedo {
@@ -936,6 +1018,10 @@ impl GameState {
 
         for (victim_id, dmg, killer_id) in damage_events {
             self.apply_damage(victim_id, dmg, killer_id, false);
+        }
+
+        for (asteroid_id, dmg, scorer) in asteroid_damage_events {
+            self.apply_asteroid_damage(asteroid_id, dmg, scorer);
         }
     }
 
@@ -1079,6 +1165,7 @@ impl GameState {
                 username: p.username.clone(),
                 kills: p.kills,
                 deaths: p.deaths,
+                score: p.score,
                 ship_class: p.ship_class,
                 alive: p.entity_id.is_some(),
             })

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::game::{EntityState, PlayerId, ShipClass};
 
 /// Wire-protocol version.  Client and server must match.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Maximum framed message size (1 MiB).
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
@@ -114,6 +114,7 @@ pub struct PlayerScore {
     pub username: String,
     pub kills: u32,
     pub deaths: u32,
+    pub score: u32,
     pub ship_class: ShipClass,
     pub alive: bool,
 }
