@@ -1092,6 +1092,12 @@ impl GameState {
     }
 }
 
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "game_loop_tests.rs"]
+mod tests;
+
 // ─── Public entry point ───────────────────────────────────────────────────────
 
 /// Run the authoritative game loop until `shutdown_rx` fires.

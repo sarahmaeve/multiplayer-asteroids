@@ -1,6 +1,7 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This project is built using Rust.
+Create tests for new features when possible.
 
 ## Commands
 
@@ -12,8 +13,7 @@ cargo build --workspace
 cargo run --bin server
 cargo run --bin server -- "My Server Name"
 
-# Run the client (connects to localhost:7777; optional username as first arg)
-cargo run --bin client -- mypilotname
+# Run the client (connects to localhost:7777)
 
 # Generate ship sprite PNGs into assets/ships/ (run once, or when re-customising sprites)
 cargo run --bin generate-assets
@@ -38,9 +38,6 @@ The project is a Cargo workspace with three crates:
 | `server` | Authoritative game simulation + TLS TCP listener |
 | `client` | macroquad renderer + TLS TCP connection |
 
-### Encryption / anti-cheat
-
-All traffic travels over **TLS** (rustls 0.23 + tokio-rustls 0.26).  The server generates a self-signed certificate at startup (`server/src/tls.rs`).  The client accepts any certificate (`client/src/tls.rs` — `SkipVerification`).  The server is fully authoritative: it runs all physics and validates every input, so clients cannot teleport, gain extra ammo, or observe other players' positions.
 
 ### Network framing (`shared/src/net.rs`)
 
@@ -67,13 +64,5 @@ macroquad owns the main thread.  Tokio runs in a `std::thread` background thread
 - `input_tx / input_rx` — `ClientMessage`s (player inputs) flowing to the network task
 
 ### Ship classes (`shared/src/game.rs`)
-
-| Variant | Display name | Role |
-|---------|-------------|------|
-| `Scout` | Interceptor | Fast, fragile |
-| `Destroyer` | Corsair | Balanced |
-| `Cruiser` | Warlord | Heavy assault |
-| `Battleship` | Dreadnought | Max armour/firepower |
-| `Carrier` | Dominion | Support / drones |
 
 All stats live in `ShipClass::stats() -> ShipStats`.
