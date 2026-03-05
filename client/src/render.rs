@@ -1015,7 +1015,15 @@ fn draw_entities(state: &RenderState, snapshot: &GameStateSnapshot, textures: &S
         }
     }
 
-    draw_mouse_crosshair(state);
+    // Determine if the local player's phaser is locked onto a target.
+    let phaser_locked = state.my_player_id.map_or(false, |my_id| {
+        state.snapshot.as_ref().map_or(false, |snap| {
+            snap.entities.iter().any(|e| {
+                e.ship_info.as_ref().map_or(false, |si| si.player_id == my_id && si.phaser_locked)
+            })
+        })
+    });
+    draw_mouse_crosshair(state, phaser_locked);
 }
 
 /// Draw a planet with a style determined by `planet_type` (encoded in `vy`).
@@ -1112,7 +1120,7 @@ fn draw_planet(cx: f32, cy: f32, radius_encoded: f32, planet_type_encoded: f32) 
     }
 }
 
-fn draw_mouse_crosshair(state: &RenderState) {
+fn draw_mouse_crosshair(state: &RenderState, phaser_locked: bool) {
     let (mx, my) = mouse_position();
     let wx = mx - screen_width() / 2.0 + state.cam_x;
     let wy = my - screen_height() / 2.0 + state.cam_y;
@@ -1125,6 +1133,24 @@ fn draw_mouse_crosshair(state: &RenderState) {
     draw_line(wx, wy - r, wx, wy - gap, 1.0, color);
     draw_line(wx, wy + gap, wx, wy + r, 1.0, color);
     draw_circle_lines(wx, wy, gap + 1.0, 0.5, color);
+
+    if phaser_locked {
+        // Pulsing red square: size oscillates between 18 and 26 px.
+        let t = get_time() as f32;
+        let pulse = (t * std::f32::consts::TAU * 2.0).sin() * 0.5 + 0.5; // 0..1 at 2 Hz
+        let half = 9.0 + pulse * 4.0;
+        let alpha = 0.55 + pulse * 0.45;
+        let sq_color = Color::new(1.0, 0.15, 0.15, alpha);
+        let thickness = 1.5;
+        // Top
+        draw_line(wx - half, wy - half, wx + half, wy - half, thickness, sq_color);
+        // Bottom
+        draw_line(wx - half, wy + half, wx + half, wy + half, thickness, sq_color);
+        // Left
+        draw_line(wx - half, wy - half, wx - half, wy + half, thickness, sq_color);
+        // Right
+        draw_line(wx + half, wy - half, wx + half, wy + half, thickness, sq_color);
+    }
 }
 
 fn draw_ship(state: &RenderState, entity: &shared::game::EntityState, textures: &ShipTextures) {

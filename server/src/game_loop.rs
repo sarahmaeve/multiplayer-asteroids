@@ -52,7 +52,7 @@ const BIG_ASTEROID_HEALTH: f32 = 500.0;
 const SMALL_ASTEROID_HEALTH: f32 = 200.0;
 
 /// What a phaser beam hit on its way to the target.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum PhaserHit {
     Ship(PlayerId),
     Asteroid(EntityId),
@@ -100,6 +100,11 @@ struct ServerPlayer {
     /// Entity ID of the currently-visible phaser beam, if any.
     /// Managed explicitly: created on fire, removed on button-release or death.
     phaser_beam_entity: Option<EntityId>,
+    /// Locked target for the phaser beam (set on first damageable hit, cleared on deactivation).
+    phaser_lock_target: Option<PhaserHit>,
+    /// Seconds remaining in the minimum 1-second beam duration; beam stays active even if the
+    /// button is released early.
+    phaser_min_remaining: f32,
     /// Shields don't regen while this timer is > 0 (reset to 5 s on damage).
     shield_regen_cooldown: f32,
     /// Ship is currently cloaked.
@@ -360,6 +365,8 @@ impl GameState {
                         fire_cooldown: 0.0,
                         phaser_cooldown: 0.0,
                         phaser_beam_entity: None,
+                        phaser_lock_target: None,
+                        phaser_min_remaining: 0.0,
                         shield_regen_cooldown: 0.0,
                         cloaked: false,
                         shields_on: true,
@@ -629,7 +636,7 @@ impl GameState {
         }
 
         // ── Apply player stat changes ────────────────────────────────────────
-        let (should_fire_torpedo, should_fire_phaser, phaser_button_active) = {
+        let (should_fire_torpedo, should_fire_phaser, phaser_effective_active) = {
             let p = self.players.get_mut(&pid).unwrap();
 
             // ── Cloak ────────────────────────────────────────────────────────
@@ -640,10 +647,11 @@ impl GameState {
                 p.cloaked = p.fuel > 0.0;
             } else {
                 p.cloaked = false;
-                // Phaser drain applies while the button is held within range
+                // Phaser drain applies while the button is held within range,
+                // or while the minimum 1-second duration is still counting down.
                 // (non-cloaked only; cloaked ships cannot fire phasers).
                 let phaser_in_range = input.mouse_distance <= stats.phaser_range;
-                let phaser_cost = if input.fire_phaser && phaser_in_range {
+                let phaser_cost = if (input.fire_phaser && phaser_in_range) || p.phaser_min_remaining > 0.0 {
                     stats.phaser_fuel_drain * dt
                 } else {
                     0.0
@@ -669,6 +677,7 @@ impl GameState {
             if p.phaser_cooldown > 0.0 {
                 p.phaser_cooldown -= dt;
             }
+            p.phaser_min_remaining = (p.phaser_min_remaining - dt).max(0.0);
 
             // Torpedo replenishment: one torpedo per 2000 ms while below max.
             if p.torpedo_count < 6 {
@@ -685,6 +694,10 @@ impl GameState {
             } else {
                 let phaser_in_range = input.mouse_distance <= stats.phaser_range;
                 let phaser_active = input.fire_phaser && phaser_in_range;
+                // Beam stays effective for at least 1 second after first firing,
+                // but drops immediately if fuel is exhausted.
+                let phaser_effective_active =
+                    (phaser_active || p.phaser_min_remaining > 0.0) && p.fuel > 0.0;
                 // Torpedo fires from the sticky pending flag (never lost between ticks),
                 // regardless of shield state — requires ammo and minimum cooldown.
                 let want_torpedo = p.pending_torpedo_fire
@@ -692,14 +705,14 @@ impl GameState {
                     && p.torpedo_count > 0;
                 (
                     want_torpedo,
-                    p.phaser_cooldown <= 0.0 && phaser_active && p.fuel > 0.0,
-                    phaser_active,
+                    p.phaser_cooldown <= 0.0 && phaser_effective_active && p.fuel > 0.0,
+                    phaser_effective_active,
                 )
             }
         };
 
         // ── Phaser beam (update every tick while active, damage at fire rate) ────
-        if phaser_button_active {
+        if phaser_effective_active {
             // Get current ship centre; beam always originates here.
             let (sx, sy) = {
                 let e = match self.entities.get(&eid) {
@@ -709,9 +722,37 @@ impl GameState {
                 (e.x, e.y)
             };
 
-            // Beam direction = mouse cursor angle; length capped at cursor distance.
-            let beam_dir = input.mouse_angle;
-            let beam_range = input.mouse_distance.min(stats.phaser_range);
+            // If we have a locked target, steer the beam toward its current position.
+            // Otherwise fall back to the mouse cursor angle.
+            let lock_pos: Option<(f32, f32)> = {
+                let p = self.players.get(&pid).unwrap();
+                match &p.phaser_lock_target {
+                    Some(PhaserHit::Ship(tid)) => {
+                        self.players
+                            .get(tid)
+                            .and_then(|tp| tp.entity_id)
+                            .and_then(|eid| self.entities.get(&eid))
+                            .map(|e| (e.x, e.y))
+                    }
+                    Some(PhaserHit::Asteroid(aeid)) => {
+                        self.entities.get(aeid).map(|e| (e.x, e.y))
+                    }
+                    None => None,
+                }
+            };
+
+            let (beam_dir, beam_range) = if let Some((tx, ty)) = lock_pos {
+                let dx = tx - sx;
+                let dy = ty - sy;
+                let dist = (dx * dx + dy * dy).sqrt().min(stats.phaser_range);
+                (dy.atan2(dx), dist)
+            } else {
+                // Stale lock (target gone) — clear it and revert to mouse aim.
+                if self.players.get(&pid).unwrap().phaser_lock_target.is_some() {
+                    self.players.get_mut(&pid).unwrap().phaser_lock_target = None;
+                }
+                (input.mouse_angle, input.mouse_distance.min(stats.phaser_range))
+            };
 
             // Cast ray to find beam endpoint and any hit this tick.
             let (beam_length, hit) = self.cast_phaser_ray(sx, sy, beam_dir, beam_range, pid);
@@ -745,29 +786,41 @@ impl GameState {
                         travel_remaining: None,
                     },
                 );
-                self.players.get_mut(&pid).unwrap().phaser_beam_entity = Some(new_id);
+                let p = self.players.get_mut(&pid).unwrap();
+                p.phaser_beam_entity = Some(new_id);
+                // Guarantee a minimum 1-second beam duration.
+                p.phaser_min_remaining = p.phaser_min_remaining.max(1.0);
             }
 
-            // Apply damage at fire-rate intervals.
+            // Apply damage at fire-rate intervals and lock on to the first hit target.
             if should_fire_phaser {
-                self.players.get_mut(&pid).unwrap().phaser_cooldown =
-                    1.0 / stats.phaser_fire_rate_hz;
+                let p = self.players.get_mut(&pid).unwrap();
+                p.phaser_cooldown = 1.0 / stats.phaser_fire_rate_hz;
+                // Record lock target on first damageable hit (ships and asteroids only).
+                if p.phaser_lock_target.is_none() {
+                    if let Some((ref h, _)) = hit {
+                        p.phaser_lock_target = Some(h.clone());
+                    }
+                }
                 match hit {
                     Some((PhaserHit::Ship(victim_id), dmg)) => {
                         self.apply_damage(victim_id, dmg, Some(pid), false);
                     }
-                    Some((PhaserHit::Asteroid(eid), dmg)) => {
-                        self.apply_asteroid_damage(eid, dmg, Some(pid));
+                    Some((PhaserHit::Asteroid(aeid), dmg)) => {
+                        self.apply_asteroid_damage(aeid, dmg, Some(pid));
                     }
                     None => {}
                 }
             }
         } else {
-            // Button released — remove beam entity immediately.
+            // Beam inactive (button up + min duration elapsed, or fuel exhausted) — clean up.
             if let Some(beam_id) = self.players.get(&pid).unwrap().phaser_beam_entity {
                 self.entities.remove(&beam_id);
             }
-            self.players.get_mut(&pid).unwrap().phaser_beam_entity = None;
+            let p = self.players.get_mut(&pid).unwrap();
+            p.phaser_beam_entity = None;
+            p.phaser_lock_target = None;
+            p.phaser_min_remaining = 0.0;
         }
 
         // ── Fire torpedo ─────────────────────────────────────────────────────
@@ -986,6 +1039,8 @@ impl GameState {
             if let Some(beam_id) = p.phaser_beam_entity.take() {
                 self.entities.remove(&beam_id);
             }
+            p.phaser_lock_target = None;
+            p.phaser_min_remaining = 0.0;
             p.hull = 0.0;
             p.shields = 0.0;
             p.deaths += 1;
@@ -1229,6 +1284,7 @@ impl GameState {
                             cloaked: p.cloaked,
                             shields_on: p.shields_on,
                             torpedo_count: p.torpedo_count,
+                            phaser_locked: p.phaser_lock_target.is_some(),
                         })
                     })
                 } else {

@@ -234,4 +234,6 @@ pub struct ShipInfo {
     pub shields_on: bool,
     /// Torpedoes available to fire
     pub torpedo_count: u8,
+    /// Phaser beam is currently locked onto a damageable target.
+    pub phaser_locked: bool,
 }
