@@ -48,6 +48,8 @@ pub struct ShipStats {
     pub primary_fire_rate_hz: f32,
     /// Muzzle speed of torpedo in units/s.
     pub primary_projectile_speed: f32,
+    /// Maximum torpedo ammo capacity (also the starting count on spawn).
+    pub max_torpedoes: u8,
     // ── Phasers (instant-hit beam) ──
     pub phaser_damage: f32,
     /// Maximum beam range in world units.
@@ -82,6 +84,7 @@ impl ShipClass {
                 primary_damage: 15.0,
                 primary_fire_rate_hz: 8.0,
                 primary_projectile_speed: 333.0,
+                max_torpedoes: 6,
                 phaser_damage: 20.0,
                 phaser_range: 200.0,
                 phaser_fire_rate_hz: 3.0,
@@ -100,6 +103,7 @@ impl ShipClass {
                 primary_damage: 25.0,
                 primary_fire_rate_hz: 4.0,
                 primary_projectile_speed: 300.0,
+                max_torpedoes: 6,
                 phaser_damage: 30.0,
                 phaser_range: 250.0,
                 phaser_fire_rate_hz: 2.0,
@@ -118,6 +122,7 @@ impl ShipClass {
                 primary_damage: 40.0,
                 primary_fire_rate_hz: 3.0,
                 primary_projectile_speed: 267.0,
+                max_torpedoes: 6,
                 phaser_damage: 50.0,
                 phaser_range: 280.0,
                 phaser_fire_rate_hz: 1.5,
@@ -136,6 +141,7 @@ impl ShipClass {
                 primary_damage: 80.0,
                 primary_fire_rate_hz: 1.6,
                 primary_projectile_speed: 233.0,
+                max_torpedoes: 6,
                 phaser_damage: 90.0,
                 phaser_range: 260.0,
                 phaser_fire_rate_hz: 1.0,
@@ -154,6 +160,7 @@ impl ShipClass {
                 primary_damage: 20.0,
                 primary_fire_rate_hz: 2.0,
                 primary_projectile_speed: 253.0,
+                max_torpedoes: 6,
                 phaser_damage: 25.0,
                 phaser_range: 240.0,
                 phaser_fire_rate_hz: 1.8,

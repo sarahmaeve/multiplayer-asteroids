@@ -1015,7 +1015,35 @@ fn draw_entities(state: &RenderState, snapshot: &GameStateSnapshot, textures: &S
         }
     }
 
-    // Determine if the local player's phaser is locked onto a target.
+    let (mx, my) = mouse_position();
+    let cursor_wx = mx - screen_width() / 2.0 + state.cam_x;
+    let cursor_wy = my - screen_height() / 2.0 + state.cam_y;
+
+    // Crosshair turns red when near an enemy ship or within radius+5 of an asteroid.
+    let cursor_on_target = state.snapshot.as_ref().map_or(false, |snap| {
+        snap.entities.iter().any(|e| {
+            match e.kind {
+                EntityKind::Ship => {
+                    let is_self = state.my_player_id
+                        .and_then(|id| e.ship_info.as_ref().map(|si| si.player_id == id))
+                        .unwrap_or(false);
+                    if is_self { return false; }
+                    let dx = e.x - cursor_wx;
+                    let dy = e.y - cursor_wy;
+                    dx * dx + dy * dy < 20.0 * 20.0
+                }
+                EntityKind::Asteroid => {
+                    let radius = e.vx; // radius encoded in vx for asteroids
+                    let dx = e.x - cursor_wx;
+                    let dy = e.y - cursor_wy;
+                    dx * dx + dy * dy < (radius + 5.0) * (radius + 5.0)
+                }
+                _ => false,
+            }
+        })
+    });
+
+    // Pulsing square only when the phaser is locked onto a target.
     let phaser_locked = state.my_player_id.map_or(false, |my_id| {
         state.snapshot.as_ref().map_or(false, |snap| {
             snap.entities.iter().any(|e| {
@@ -1023,7 +1051,8 @@ fn draw_entities(state: &RenderState, snapshot: &GameStateSnapshot, textures: &S
             })
         })
     });
-    draw_mouse_crosshair(state, phaser_locked);
+
+    draw_mouse_crosshair(state, cursor_on_target, phaser_locked);
 }
 
 /// Draw a planet with a style determined by `planet_type` (encoded in `vy`).
@@ -1120,35 +1149,35 @@ fn draw_planet(cx: f32, cy: f32, radius_encoded: f32, planet_type_encoded: f32) 
     }
 }
 
-fn draw_mouse_crosshair(state: &RenderState, phaser_locked: bool) {
+fn draw_mouse_crosshair(state: &RenderState, cursor_on_target: bool, phaser_locked: bool) {
     let (mx, my) = mouse_position();
     let wx = mx - screen_width() / 2.0 + state.cam_x;
     let wy = my - screen_height() / 2.0 + state.cam_y;
 
     let r = 8.0;
     let gap = 3.0;
-    let color = Color::new(0.9, 0.9, 0.9, 0.75);
-    draw_line(wx - r, wy, wx - gap, wy, 1.0, color);
-    draw_line(wx + gap, wy, wx + r, wy, 1.0, color);
-    draw_line(wx, wy - r, wx, wy - gap, 1.0, color);
-    draw_line(wx, wy + gap, wx, wy + r, 1.0, color);
-    draw_circle_lines(wx, wy, gap + 1.0, 0.5, color);
+    let crosshair_color = if cursor_on_target {
+        Color::new(1.0, 0.15, 0.15, 0.95)
+    } else {
+        Color::new(0.9, 0.9, 0.9, 0.75)
+    };
+    draw_line(wx - r, wy, wx - gap, wy, 1.0, crosshair_color);
+    draw_line(wx + gap, wy, wx + r, wy, 1.0, crosshair_color);
+    draw_line(wx, wy - r, wx, wy - gap, 1.0, crosshair_color);
+    draw_line(wx, wy + gap, wx, wy + r, 1.0, crosshair_color);
+    draw_circle_lines(wx, wy, gap + 1.0, 0.5, crosshair_color);
 
     if phaser_locked {
-        // Pulsing red square: size oscillates between 18 and 26 px.
+        // Pulsing red square while phaser lock is active (2 Hz oscillation).
         let t = get_time() as f32;
-        let pulse = (t * std::f32::consts::TAU * 2.0).sin() * 0.5 + 0.5; // 0..1 at 2 Hz
+        let pulse = (t * std::f32::consts::TAU * 2.0).sin() * 0.5 + 0.5; // 0..1
         let half = 9.0 + pulse * 4.0;
         let alpha = 0.55 + pulse * 0.45;
         let sq_color = Color::new(1.0, 0.15, 0.15, alpha);
         let thickness = 1.5;
-        // Top
         draw_line(wx - half, wy - half, wx + half, wy - half, thickness, sq_color);
-        // Bottom
         draw_line(wx - half, wy + half, wx + half, wy + half, thickness, sq_color);
-        // Left
         draw_line(wx - half, wy - half, wx - half, wy + half, thickness, sq_color);
-        // Right
         draw_line(wx + half, wy - half, wx + half, wy + half, thickness, sq_color);
     }
 }

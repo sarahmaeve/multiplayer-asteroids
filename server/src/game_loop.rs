@@ -376,7 +376,7 @@ impl GameState {
                         last_input_seq: 0,
                         input: PlayerInput::default(),
                         msg_tx,
-                        torpedo_count: 6,
+                        torpedo_count: ShipClass::Destroyer.stats().max_torpedoes,
                         torpedo_regen_timer: 0.0,
                         pending_torpedo_fire: false,
                         score: 0,
@@ -547,7 +547,7 @@ impl GameState {
             player.shield_regen_cooldown = 0.0;
             player.cloaked = false;
             player.shields_on = true;
-            player.torpedo_count = 6;
+            player.torpedo_count = stats.max_torpedoes;
             player.torpedo_regen_timer = 0.0;
             player.pending_torpedo_fire = false;
         }
@@ -680,11 +680,11 @@ impl GameState {
             p.phaser_min_remaining = (p.phaser_min_remaining - dt).max(0.0);
 
             // Torpedo replenishment: one torpedo per 2000 ms while below max.
-            if p.torpedo_count < 6 {
+            if p.torpedo_count < stats.max_torpedoes {
                 p.torpedo_regen_timer += dt;
                 while p.torpedo_regen_timer >= 2.0 {
                     p.torpedo_regen_timer -= 2.0;
-                    p.torpedo_count = (p.torpedo_count + 1).min(6);
+                    p.torpedo_count = (p.torpedo_count + 1).min(stats.max_torpedoes);
                 }
             }
 
