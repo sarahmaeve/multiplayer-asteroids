@@ -572,11 +572,11 @@ impl GameState {
                 p.phaser_cooldown -= dt;
             }
 
-            // Torpedo replenishment: one torpedo per 500 ms while below max.
+            // Torpedo replenishment: one torpedo per 2000 ms while below max.
             if p.torpedo_count < 6 {
                 p.torpedo_regen_timer += dt;
-                while p.torpedo_regen_timer >= 1.5 {
-                    p.torpedo_regen_timer -= 1.5;
+                while p.torpedo_regen_timer >= 2.0 {
+                    p.torpedo_regen_timer -= 2.0;
                     p.torpedo_count = (p.torpedo_count + 1).min(6);
                 }
             }

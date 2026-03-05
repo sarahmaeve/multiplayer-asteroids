@@ -232,6 +232,6 @@ pub struct ShipInfo {
     pub cloaked: bool,
     /// Shields are currently switched on by the player.
     pub shields_on: bool,
-    /// Torpedoes available to fire (0–12).
+    /// Torpedoes available to fire
     pub torpedo_count: u8,
 }

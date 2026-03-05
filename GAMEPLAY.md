@@ -16,7 +16,7 @@ server until the player confirms.
 
 | Action | Input |
 |--------|-------|
-| Type a character | Any key (A-Z, 0-9, `_` accepted; lowercase auto-uppercased) |
+| Type a character | Any key (A-Z, 0-9, a-z, `_` accepted; lowercase auto-uppercased) |
 | Delete last character | `Backspace` |
 | Confirm | `Enter` |
 

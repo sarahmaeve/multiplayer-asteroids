@@ -280,9 +280,9 @@ fn update_phase(
                 buf.pop();
                 error = None;
             }
-            // Drain the char queue; accept A-Z, 0-9, _ (case-insensitive input).
+            // Drain the char queue; accept A-Z, a-z, 0-9, _ (case-insensitive input).
             while let Some(c) = get_char_pressed() {
-                let c = c.to_ascii_uppercase();
+               // let c = c.to_ascii_uppercase();
                 if (c.is_ascii_alphanumeric() || c == '_') && buf.len() < 12 {
                     buf.push(c);
                     error = None;
@@ -544,7 +544,7 @@ fn draw_login_name(state: &RenderState) {
     centered_text("FLEET COMMANDER", cx, cy - 138.0, 40.0, GOLD);
     centered_text(&state.server_name, cx, cy - 104.0, 15.0, Color::new(0.55, 0.55, 0.65, 1.0));
     centered_text("Enter pilot callsign", cx, cy - 72.0, 20.0, LIGHTGRAY);
-    centered_text("4 – 12 characters   A-Z  0-9  _", cx, cy - 48.0, 14.0, DARKGRAY);
+    centered_text("4 – 12 characters   A-Z a-z 0-9  _", cx, cy - 48.0, 14.0, DARKGRAY);
 
     // Input box.
     let cursor = if (get_time() % 1.0) < 0.5 { "█" } else { " " };
@@ -724,22 +724,17 @@ fn draw_help_overlay() {
     lrow!("LMB (hold)",    "Aim at cursor + thrust forward");
 
     lhead!("WEAPONS");
-    lrow!("T",             "Fire torpedo (one shot per press)");
-    lrow!("RMB / L-Shift", "Fire phaser beam (drains fuel)");
+    lrow!("T",             "Fire torpedo");
+    lrow!("RMB / L-Shift", "Fire phaser beam");
 
     lhead!("SHIP SYSTEMS");
     lrow!("F",             "Toggle shields on / off");
-    lrow!("C  (toggle)",   "Cloak on/off  (Scout/Dest/Cruiser)");
+    lrow!("C",             "Cloak on/off");
     lrow!("Ctrl+Q",        "Self-destruct (5 s countdown)");
 
     // ── Right column: interface & respawn ────────────────────────────────────
     rhead!("INTERFACE");
     rrow!("H",             "Show / hide this help screen");
-
-    rhead!("AFTER DEATH");
-    rrow!("↑ / ↓",         "Choose a different ship class");
-    rrow!("Enter / R",     "Confirm selection and respawn");
-    rrow!("(10 s timeout)", "Auto-respawns in previous ship");
 
     rhead!("CLOAKING RULES");
     rrow!("While cloaked:", "Invisible to all other players");
@@ -748,11 +743,6 @@ fn draw_help_overlay() {
     rrow!("",               "Fuel drains continuously");
     rrow!("",               "Uncloak = fuel exhausted");
 
-    rhead!("SHIELD RULES");
-    rrow!("Shields ON:",    "Absorb damage before hull");
-    rrow!("",               "Each hit drains fuel");
-    rrow!("",               "Fuel → 0 collapses shields");
-    rrow!("",               "Regen after 5 s with no hits");
 
     let _ = (y_l, y_r); // final row increments intentionally unused
 
