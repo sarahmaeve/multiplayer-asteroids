@@ -106,6 +106,8 @@ struct RenderState {
     cam_y: f32,
     /// Local shield toggle — flips on each `F` press (only active in Playing).
     shields_on: bool,
+    /// Cloak toggle — flips on each `C` press; auto-cleared when fuel is exhausted.
+    cloak_toggle: bool,
     /// Whether the in-game help overlay is visible (toggled by `H`).
     show_help: bool,
     /// Server display name received from `ServerInfo` (shown on login screens).
@@ -126,6 +128,7 @@ impl Default for RenderState {
             cam_x: 0.0,
             cam_y: 0.0,
             shields_on: true,
+            cloak_toggle: false,
             show_help: false,
             server_name: "test server".to_string(),
             login_tx: None,
@@ -276,6 +279,7 @@ fn update_phase(
                 input_tx.send(ClientMessage::RequestRespawn).ok();
                 state.current_class = class;
                 state.shields_on = true;
+                state.cloak_toggle = false;
                 return AppPhase::Playing;
             }
 
@@ -292,12 +296,19 @@ fn handle_server_message(state: &mut RenderState, msg: ServerMessage) {
             state.my_player_id = Some(player_id);
         }
         ServerMessage::GameState(snapshot) => {
-            // Keep current_class in sync with what the server has assigned.
+            // Keep current_class and cloak_toggle in sync with server state.
             if let Some(pid) = state.my_player_id {
                 for entity in &snapshot.entities {
                     if let Some(info) = &entity.ship_info {
                         if info.player_id == pid {
                             state.current_class = info.class;
+                            // Only auto-clear the cloak toggle when fuel is truly
+                            // exhausted (server dropped the cloak due to empty tank).
+                            // Never clear it based on a stale snapshot that arrives
+                            // before the server has processed the keypress.
+                            if state.cloak_toggle && info.fuel == 0.0 {
+                                state.cloak_toggle = false;
+                            }
                         }
                     }
                 }
@@ -339,22 +350,42 @@ fn collect_input(state: &mut RenderState) -> PlayerInput {
     if is_key_pressed(KeyCode::H) {
         state.show_help = !state.show_help;
     }
+    // Cloak is a toggle: press C to engage, press C again (or fuel runs out) to disengage.
+    if is_key_pressed(KeyCode::C) && state.current_class.can_cloak() {
+        state.cloak_toggle = !state.cloak_toggle;
+    }
 
     let (mx, my) = mouse_position();
-    let aim_angle = Some((my - screen_height() / 2.0).atan2(mx - screen_width() / 2.0));
+    let dx = mx - screen_width() / 2.0;
+    let dy = my - screen_height() / 2.0;
+
+    // Mouse angle and distance from ship centre (world coords are 1:1 with pixels).
+    let mouse_angle = dy.atan2(dx);
+    let mouse_distance = dx.hypot(dy);
+
+    // LMB: aim ship toward cursor AND thrust forward while held.
+    let lmb = is_mouse_button_down(MouseButton::Left);
+    let aim_angle = if lmb { Some(mouse_angle) } else { None };
+
+    // Suppress phaser if the cursor is beyond this ship class's max range.
+    let phaser_in_range = mouse_distance <= state.current_class.stats().phaser_range;
 
     PlayerInput {
-        thrust: is_key_down(KeyCode::Up) || is_key_down(KeyCode::W),
+        // W/↑ thrusts; holding LMB also thrusts (ship accelerates toward cursor).
+        thrust: is_key_down(KeyCode::Up) || is_key_down(KeyCode::W) || lmb,
         reverse_thrust: is_key_down(KeyCode::Down) || is_key_down(KeyCode::S),
         turn_left: is_key_down(KeyCode::Left) || is_key_down(KeyCode::A),
         turn_right: is_key_down(KeyCode::Right) || is_key_down(KeyCode::D),
-        fire_primary: is_key_down(KeyCode::Space)
-            || is_mouse_button_down(MouseButton::Left),
-        fire_phaser: is_key_down(KeyCode::LeftShift)
-            || is_mouse_button_down(MouseButton::Right),
-        cloak_active: is_key_down(KeyCode::C),
+        // T fires one torpedo per keypress; server cooldown gates rapid fire.
+        fire_primary: is_key_pressed(KeyCode::T),
+        fire_phaser: (is_key_down(KeyCode::LeftShift)
+            || is_mouse_button_down(MouseButton::Right))
+            && phaser_in_range,
+        cloak_active: state.cloak_toggle,
         shields_active: state.shields_on,
         aim_angle,
+        mouse_angle,
+        mouse_distance,
         sequence: state.input_seq,
     }
 }
@@ -525,15 +556,15 @@ fn draw_help_overlay() {
     lrow!("S / ↓",         "Reverse thrust");
     lrow!("A / ←",         "Turn left");
     lrow!("D / →",         "Turn right");
-    lrow!("Mouse move",    "Aim ship at cursor");
+    lrow!("LMB (hold)",    "Aim at cursor + thrust forward");
 
     lhead!("WEAPONS");
-    lrow!("LMB / Space",   "Fire torpedo");
-    lrow!("RMB / L-Shift", "Fire phaser beam");
+    lrow!("T",             "Fire torpedo (one shot per press)");
+    lrow!("RMB / L-Shift", "Fire phaser beam (drains fuel)");
 
     lhead!("SHIP SYSTEMS");
     lrow!("F",             "Toggle shields on / off");
-    lrow!("C  (hold)",     "Engage cloak  (Scout/Dest/Cruiser)");
+    lrow!("C  (toggle)",   "Cloak on/off  (Scout/Dest/Cruiser)");
 
     // ── Right column: interface & respawn ────────────────────────────────────
     rhead!("INTERFACE");
@@ -761,13 +792,106 @@ fn draw_entities(state: &RenderState, snapshot: &GameStateSnapshot, textures: &S
                 draw_poly_lines(entity.x, entity.y, 6, 22.0, 0.0, 2.0, GRAY);
             }
             EntityKind::Planet => {
-                draw_circle(entity.x, entity.y, 60.0, DARKBLUE);
-                draw_circle_lines(entity.x, entity.y, 60.0, 2.0, BLUE);
+                draw_planet(entity.x, entity.y, entity.vx, entity.vy);
             }
         }
     }
 
     draw_mouse_crosshair(state);
+}
+
+/// Draw a planet with a style determined by `planet_type` (encoded in `vy`).
+///
+/// The five types are:
+///   0 = rocky/desert   1 = gas giant   2 = ocean   3 = lava   4 = ice
+///
+/// `radius` is encoded in `vx`; fall back to 60 if zero (old server).
+fn draw_planet(cx: f32, cy: f32, radius_encoded: f32, planet_type_encoded: f32) {
+    let r = if radius_encoded > 0.0 { radius_encoded } else { 60.0 };
+
+    // Per-type colour palette: (base, feature, highlight, atmo_alpha)
+    let (base, feature, highlight, atmo_a) = match planet_type_encoded as u32 {
+        0 => ( // rocky / desert
+            Color::new(0.53, 0.36, 0.20, 1.0),
+            Color::new(0.38, 0.26, 0.14, 1.0),
+            Color::new(0.78, 0.60, 0.40, 1.0),
+            0.18f32,
+        ),
+        1 => ( // gas giant
+            Color::new(0.78, 0.52, 0.18, 1.0),
+            Color::new(0.56, 0.32, 0.08, 1.0),
+            Color::new(0.96, 0.82, 0.50, 1.0),
+            0.22,
+        ),
+        2 => ( // ocean
+            Color::new(0.10, 0.24, 0.70, 1.0),
+            Color::new(0.05, 0.48, 0.28, 1.0),
+            Color::new(0.35, 0.65, 1.00, 1.0),
+            0.22,
+        ),
+        3 => ( // lava
+            Color::new(0.52, 0.08, 0.02, 1.0),
+            Color::new(0.90, 0.20, 0.02, 1.0),
+            Color::new(1.00, 0.45, 0.05, 1.0),
+            0.30,
+        ),
+        _ => ( // ice (type 4)
+            Color::new(0.72, 0.86, 1.00, 1.0),
+            Color::new(0.58, 0.76, 0.94, 1.0),
+            Color::new(0.96, 0.98, 1.00, 1.0),
+            0.20,
+        ),
+    };
+
+    let atmo_color = Color::new(highlight.r, highlight.g, highlight.b, atmo_a);
+
+    // Atmosphere halo (behind planet body).
+    draw_circle(cx, cy, r + 12.0, atmo_color);
+    draw_circle(cx, cy, r + 6.0, Color::new(atmo_color.r, atmo_color.g, atmo_color.b, atmo_a * 0.5));
+
+    // Base planet body.
+    draw_circle(cx, cy, r, base);
+
+    // Surface feature blobs (craters / landmasses / lava flows).
+    draw_circle(cx + r * 0.22, cy + r * 0.18, r * 0.40, feature);
+    draw_circle(cx - r * 0.30, cy - r * 0.22, r * 0.28, feature);
+    draw_circle(cx + r * 0.05, cy - r * 0.38, r * 0.20, feature);
+
+    // Specular highlight (upper-left, gives pseudo-3D look).
+    draw_circle(
+        cx - r * 0.28,
+        cy - r * 0.28,
+        r * 0.52,
+        Color::new(highlight.r, highlight.g, highlight.b, 0.30),
+    );
+
+    // Limb (edge darkening).
+    draw_circle_lines(cx, cy, r, 3.0, Color::new(base.r * 0.5, base.g * 0.5, base.b * 0.5, 0.8));
+
+    // Gas giant: horizontal bands + rings.
+    if planet_type_encoded as u32 == 1 {
+        // Equatorial band.
+        draw_circle(cx, cy, r * 0.75, Color::new(feature.r, feature.g, feature.b, 0.25));
+        draw_circle(cx, cy, r * 0.45, Color::new(highlight.r, highlight.g, highlight.b, 0.18));
+        // Rings (top-down view → circles).
+        draw_circle_lines(cx, cy, r * 1.45, 3.0, Color::new(0.75, 0.60, 0.35, 0.50));
+        draw_circle_lines(cx, cy, r * 1.60, 2.0, Color::new(0.70, 0.55, 0.30, 0.38));
+        draw_circle_lines(cx, cy, r * 1.78, 1.5, Color::new(0.65, 0.50, 0.25, 0.25));
+    }
+
+    // Lava planet: glowing cracks.
+    if planet_type_encoded as u32 == 3 {
+        draw_circle_lines(cx, cy, r * 0.80, 2.0, Color::new(1.0, 0.55, 0.05, 0.45));
+        draw_circle_lines(cx, cy, r * 0.55, 1.5, Color::new(1.0, 0.65, 0.10, 0.35));
+        // Outer glow.
+        draw_circle_lines(cx, cy, r + 4.0, 2.5, Color::new(1.0, 0.35, 0.02, 0.35));
+    }
+
+    // Ice planet: polar ice cap shimmer.
+    if planet_type_encoded as u32 == 4 {
+        draw_circle(cx, cy - r * 0.40, r * 0.40,
+            Color::new(0.96, 0.98, 1.0, 0.45));
+    }
 }
 
 fn draw_mouse_crosshair(state: &RenderState) {
@@ -850,6 +974,30 @@ fn draw_ship(state: &RenderState, entity: &shared::game::EntityState, textures: 
         let shield_frac = (info.shields / info.class.stats().max_shields).clamp(0.0, 1.0);
         draw_rectangle(cx - bar_w / 2.0, bar_y - 4.0, bar_w * shield_frac, 3.0,
             Color::new(0.3, 0.7, 1.0, alpha));
+    }
+
+    // Player name — visible to all, hidden while cloaked.
+    if !info.cloaked {
+        let username = state.scores.iter()
+            .find(|s| s.player_id == info.player_id)
+            .map(|s| s.username.as_str())
+            .unwrap_or("");
+        if !username.is_empty() {
+            let font_size = 11u16;
+            let name_w = measure_text(username, None, font_size, 1.0).width;
+            let name_color = if is_me {
+                Color::new(0.4, 1.0, 0.4, 0.9)
+            } else {
+                Color::new(0.85, 0.85, 0.85, 0.80)
+            };
+            draw_text(
+                username,
+                cx - name_w / 2.0,
+                cy + size + 16.0,
+                font_size as f32,
+                name_color,
+            );
+        }
     }
 }
 
@@ -934,7 +1082,7 @@ fn draw_hud(state: &RenderState, snapshot: &GameStateSnapshot) {
         20.0, screen_height() - 10.0, 12.0, DARKGRAY,
     );
 
-    let hint = "Mouse: aim  LMB/Space: torpedo  RMB/Shift: phaser  F: shields  C: cloak  WASD: thrust/turn";
+    let hint = "LMB: aim+thrust  T: torpedo  RMB/Shift: phaser  F: shields  C: cloak toggle  WASD: thrust/turn";
     let hw = measure_text(hint, None, 12, 1.0).width;
     draw_text(hint, screen_width() - hw - 10.0, screen_height() - 10.0, 12.0, DARKGRAY);
 }

@@ -51,6 +51,10 @@ pub struct ShipStats {
     pub phaser_range: f32,
     /// How many phaser shots can be fired per second.
     pub phaser_fire_rate_hz: f32,
+    // ── Phaser energy cost ──
+    /// Fuel drained per second while the phaser button is held.
+    /// Sustained-fire duration ≈ fuel_capacity / (phaser_fuel_drain − fuel_regen).
+    pub phaser_fuel_drain: f32,
     // ── Cloak ──
     /// Fuel drained per second while cloaking.  Zero for ships that cannot cloak.
     pub cloak_fuel_drain: f32,
@@ -78,6 +82,7 @@ impl ShipClass {
                 phaser_damage: 20.0,
                 phaser_range: 200.0,
                 phaser_fire_rate_hz: 3.0,
+                phaser_fuel_drain: 55.0, // 200 / (55−5) = 4.0 s sustained
                 cloak_fuel_drain: 25.0,
                 shield_energy_per_damage: 1.5,
                 fuel_capacity: 200.0,
@@ -95,6 +100,7 @@ impl ShipClass {
                 phaser_damage: 30.0,
                 phaser_range: 250.0,
                 phaser_fire_rate_hz: 2.0,
+                phaser_fuel_drain: 68.0, // 300 / (68−8) = 5.0 s sustained
                 cloak_fuel_drain: 20.0,
                 shield_energy_per_damage: 1.0,
                 fuel_capacity: 300.0,
@@ -112,6 +118,7 @@ impl ShipClass {
                 phaser_damage: 50.0,
                 phaser_range: 280.0,
                 phaser_fire_rate_hz: 1.5,
+                phaser_fuel_drain: 77.0, // 400 / (77−10) ≈ 6.0 s sustained
                 cloak_fuel_drain: 28.0,
                 shield_energy_per_damage: 0.8,
                 fuel_capacity: 400.0,
@@ -129,6 +136,7 @@ impl ShipClass {
                 phaser_damage: 90.0,
                 phaser_range: 260.0,
                 phaser_fire_rate_hz: 1.0,
+                phaser_fuel_drain: 74.5, // 500 / (74.5−12) = 8.0 s sustained
                 cloak_fuel_drain: 0.0, // cannot cloak
                 shield_energy_per_damage: 0.6,
                 fuel_capacity: 500.0,
@@ -146,6 +154,7 @@ impl ShipClass {
                 phaser_damage: 25.0,
                 phaser_range: 240.0,
                 phaser_fire_rate_hz: 1.8,
+                phaser_fuel_drain: 101.0, // 600 / (101−15) ≈ 7.0 s sustained
                 cloak_fuel_drain: 0.0, // cannot cloak
                 shield_energy_per_damage: 0.7,
                 fuel_capacity: 600.0,

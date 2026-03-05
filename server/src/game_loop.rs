@@ -71,6 +71,9 @@ struct ServerPlayer {
     fire_cooldown: f32,
     /// Cooldown before the next phaser shot can be fired.
     phaser_cooldown: f32,
+    /// Entity ID of the currently-visible phaser beam, if any.
+    /// Managed explicitly: created on fire, removed on button-release or death.
+    phaser_beam_entity: Option<EntityId>,
     /// Shields don't regen while this timer is > 0 (reset to 5 s on damage).
     shield_regen_cooldown: f32,
     /// Ship is currently cloaked.
@@ -156,16 +159,27 @@ impl GameState {
                 },
             );
         }
-        for i in 20u32..25u32 {
+
+        // (planet_type, radius): type is encoded in vy, radius in vx.
+        // Types: 0=rocky, 1=gas giant, 2=ocean, 3=lava, 4=ice
+        const PLANET_CONFIGS: [(f32, f32); 5] = [
+            (0.0, 70.0),
+            (1.0, 110.0),
+            (2.0, 75.0),
+            (3.0, 65.0),
+            (4.0, 55.0),
+        ];
+        for (i, &(planet_type, radius)) in PLANET_CONFIGS.iter().enumerate() {
+            let id = 20 + i as u32;
             self.entities.insert(
-                i,
+                id,
                 ServerEntity {
-                    id: i,
+                    id,
                     kind: EntityKind::Planet,
-                    x: rng.gen_range(1_000.0..WORLD_WIDTH - 1_000.0),
-                    y: rng.gen_range(1_000.0..WORLD_HEIGHT - 1_000.0),
-                    vx: 0.0,
-                    vy: 0.0,
+                    x: rng.gen_range(1_500.0..WORLD_WIDTH - 1_500.0),
+                    y: rng.gen_range(1_500.0..WORLD_HEIGHT - 1_500.0),
+                    vx: radius,       // collision radius
+                    vy: planet_type,  // visual type
                     angle: 0.0,
                     owner: None,
                     damage: 0.0,
@@ -193,6 +207,7 @@ impl GameState {
                         fuel: 0.0,
                         fire_cooldown: 0.0,
                         phaser_cooldown: 0.0,
+                        phaser_beam_entity: None,
                         shield_regen_cooldown: 0.0,
                         cloaked: false,
                         shields_on: true,
@@ -211,6 +226,9 @@ impl GameState {
                 if let Some(player) = self.players.remove(&id) {
                     if let Some(eid) = player.entity_id {
                         self.entities.remove(&eid);
+                    }
+                    if let Some(beam_id) = player.phaser_beam_entity {
+                        self.entities.remove(&beam_id);
                     }
                 }
             }
@@ -292,6 +310,7 @@ impl GameState {
             .retain(|_, e| e.lifetime.map_or(true, |lt| lt > 0.0));
 
         self.check_collisions();
+        self.check_planet_collisions();
     }
 
     fn respawn_player(&mut self, pid: PlayerId) {
@@ -304,6 +323,7 @@ impl GameState {
             player.fuel = stats.fuel_capacity;
             player.fire_cooldown = 0.0;
             player.phaser_cooldown = 0.0;
+            player.phaser_beam_entity = None;
             player.shield_regen_cooldown = 0.0;
             player.cloaked = false;
             player.shields_on = true;
@@ -393,7 +413,7 @@ impl GameState {
         }
 
         // ── Apply player stat changes ────────────────────────────────────────
-        let (should_fire_torpedo, should_fire_phaser) = {
+        let (should_fire_torpedo, should_fire_phaser, phaser_button_active) = {
             let p = self.players.get_mut(&pid).unwrap();
 
             // ── Cloak ────────────────────────────────────────────────────────
@@ -404,8 +424,15 @@ impl GameState {
                 p.cloaked = p.fuel > 0.0;
             } else {
                 p.cloaked = false;
-                // Normal operation: subtract thrust cost and add idle regen.
-                p.fuel = (p.fuel - fuel_consumed + stats.fuel_regen * dt)
+                // Phaser drain applies while the button is held within range
+                // (non-cloaked only; cloaked ships cannot fire phasers).
+                let phaser_in_range = input.mouse_distance <= stats.phaser_range;
+                let phaser_cost = if input.fire_phaser && phaser_in_range {
+                    stats.phaser_fuel_drain * dt
+                } else {
+                    0.0
+                };
+                p.fuel = (p.fuel - fuel_consumed - phaser_cost + stats.fuel_regen * dt)
                     .clamp(0.0, stats.fuel_capacity);
             }
 
@@ -429,14 +456,80 @@ impl GameState {
 
             // Cloaked ships cannot fire weapons.
             if p.cloaked {
-                (false, false)
+                (false, false, false)
             } else {
+                let phaser_in_range = input.mouse_distance <= stats.phaser_range;
+                let phaser_active = input.fire_phaser && phaser_in_range;
                 (
                     p.fire_cooldown <= 0.0 && input.fire_primary,
-                    p.phaser_cooldown <= 0.0 && input.fire_phaser,
+                    p.phaser_cooldown <= 0.0 && phaser_active && p.fuel > 0.0,
+                    phaser_active,
                 )
             }
         };
+
+        // ── Phaser beam (update every tick while active, damage at fire rate) ────
+        if phaser_button_active {
+            // Get current ship centre; beam always originates here.
+            let (sx, sy) = {
+                let e = match self.entities.get(&eid) {
+                    Some(e) => e,
+                    None => return,
+                };
+                (e.x, e.y)
+            };
+
+            // Beam direction = mouse cursor angle; length capped at cursor distance.
+            let beam_dir = input.mouse_angle;
+            let beam_range = input.mouse_distance.min(stats.phaser_range);
+
+            // Cast ray to find beam endpoint and any hit this tick.
+            let (beam_length, hit) = self.cast_phaser_ray(sx, sy, beam_dir, beam_range, pid);
+
+            // Update existing beam entity or create one if missing.
+            let existing_beam_id = self.players.get(&pid).unwrap().phaser_beam_entity;
+            if let Some(bid) = existing_beam_id {
+                if let Some(beam) = self.entities.get_mut(&bid) {
+                    beam.x = sx;
+                    beam.y = sy;
+                    beam.angle = beam_dir;
+                    beam.vx = beam_length;
+                }
+            } else {
+                let new_id = self.alloc_entity_id();
+                self.entities.insert(
+                    new_id,
+                    ServerEntity {
+                        id: new_id,
+                        kind: EntityKind::Phaser,
+                        x: sx,
+                        y: sy,
+                        vx: beam_length,
+                        vy: 0.0,
+                        angle: beam_dir,
+                        owner: Some(pid),
+                        damage: 0.0,
+                        lifetime: None,
+                    },
+                );
+                self.players.get_mut(&pid).unwrap().phaser_beam_entity = Some(new_id);
+            }
+
+            // Apply damage at fire-rate intervals.
+            if should_fire_phaser {
+                self.players.get_mut(&pid).unwrap().phaser_cooldown =
+                    1.0 / stats.phaser_fire_rate_hz;
+                if let Some((victim_id, dmg)) = hit {
+                    self.apply_damage(victim_id, dmg, Some(pid));
+                }
+            }
+        } else {
+            // Button released — remove beam entity immediately.
+            if let Some(beam_id) = self.players.get(&pid).unwrap().phaser_beam_entity {
+                self.entities.remove(&beam_id);
+            }
+            self.players.get_mut(&pid).unwrap().phaser_beam_entity = None;
+        }
 
         // ── Fire torpedo ─────────────────────────────────────────────────────
         if should_fire_torpedo {
@@ -465,42 +558,6 @@ impl GameState {
             );
         }
 
-        // ── Fire phaser ──────────────────────────────────────────────────────
-        if should_fire_phaser {
-            self.players.get_mut(&pid).unwrap().phaser_cooldown =
-                1.0 / stats.phaser_fire_rate_hz;
-
-            let (sx, sy, sangle) = {
-                let e = self.entities.get(&eid).unwrap();
-                (e.x, e.y, e.angle)
-            };
-
-            let (beam_length, hit) = self.cast_phaser_ray(sx, sy, sangle, stats.phaser_range, pid);
-
-            // Spawn a short-lived visual beam entity.
-            // `vx` carries beam_length; `vy` is unused for Phaser entities.
-            let beam_id = self.alloc_entity_id();
-            self.entities.insert(
-                beam_id,
-                ServerEntity {
-                    id: beam_id,
-                    kind: EntityKind::Phaser,
-                    x: sx,
-                    y: sy,
-                    vx: beam_length,
-                    vy: 0.0,
-                    angle: sangle,
-                    owner: Some(pid),
-                    damage: 0.0,
-                    lifetime: Some(0.15),
-                },
-            );
-
-            // Apply immediate damage.
-            if let Some((victim_id, dmg)) = hit {
-                self.apply_damage(victim_id, dmg, Some(pid));
-            }
-        }
     }
 
     /// Cast a phaser ray from `(ox, oy)` in direction `angle`.
@@ -611,6 +668,9 @@ impl GameState {
                 if let Some(eid) = p.entity_id.take() {
                     self.entities.remove(&eid);
                 }
+                if let Some(beam_id) = p.phaser_beam_entity.take() {
+                    self.entities.remove(&beam_id);
+                }
                 p.hull = 0.0;
                 p.shields = 0.0;
                 p.deaths += 1;
@@ -689,6 +749,70 @@ impl GameState {
 
         for (victim_id, dmg, killer_id) in damage_events {
             self.apply_damage(victim_id, dmg, killer_id);
+        }
+    }
+
+    // ── Planet collision ──────────────────────────────────────────────────────
+
+    /// Push ships out of planets and apply impact damage.
+    fn check_planet_collisions(&mut self) {
+        const SHIP_RADIUS: f32 = 18.0;
+        const IMPACT_DAMAGE: f32 = 25.0;
+
+        // Snapshot planet data: (x, y, radius).
+        let planets: Vec<(f32, f32, f32)> = self
+            .entities
+            .values()
+            .filter(|e| e.kind == EntityKind::Planet)
+            .map(|e| (e.x, e.y, e.vx))
+            .collect();
+
+        // Snapshot ship entity IDs and their owning player IDs.
+        let ship_ids: Vec<(EntityId, PlayerId)> = self
+            .entities
+            .values()
+            .filter(|e| e.kind == EntityKind::Ship)
+            .filter_map(|e| Some((e.id, e.owner?)))
+            .collect();
+
+        let mut damage_events: Vec<(PlayerId, f32)> = Vec::new();
+
+        for (eid, pid) in &ship_ids {
+            let (sx, sy) = match self.entities.get(eid) {
+                Some(e) => (e.x, e.y),
+                None => continue,
+            };
+
+            for &(px, py, pradius) in &planets {
+                let dx = sx - px;
+                let dy = sy - py;
+                let dist_sq = dx * dx + dy * dy;
+                let min_dist = pradius + SHIP_RADIUS;
+
+                if dist_sq < min_dist * min_dist {
+                    let dist = dist_sq.sqrt().max(0.001);
+                    let nx = dx / dist;
+                    let ny = dy / dist;
+                    let push = min_dist - dist;
+
+                    if let Some(e) = self.entities.get_mut(eid) {
+                        // Push ship to planet surface.
+                        e.x = (e.x + nx * push).rem_euclid(WORLD_WIDTH);
+                        e.y = (e.y + ny * push).rem_euclid(WORLD_HEIGHT);
+                        // Reflect velocity off planet surface, then dampen.
+                        let dot = e.vx * nx + e.vy * ny;
+                        e.vx = (e.vx - 2.0 * dot * nx) * 0.5;
+                        e.vy = (e.vy - 2.0 * dot * ny) * 0.5;
+                    }
+
+                    damage_events.push((*pid, IMPACT_DAMAGE));
+                    break; // at most one planet hit per ship per tick
+                }
+            }
+        }
+
+        for (pid, dmg) in damage_events {
+            self.apply_damage(pid, dmg, None);
         }
     }
 

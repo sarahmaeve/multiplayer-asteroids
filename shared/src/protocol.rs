@@ -56,6 +56,13 @@ pub struct PlayerInput {
     /// When `Some`, the server sets the ship's heading directly to this angle
     /// instead of applying `turn_left`/`turn_right`.  Sent by mouse players.
     pub aim_angle: Option<f32>,
+    /// Angle from ship centre to the mouse cursor (world space, radians).
+    /// Used as the phaser beam direction regardless of ship heading.
+    pub mouse_angle: f32,
+    /// Distance from ship centre to the mouse cursor in world units.
+    /// The phaser beam extends only this far; firing is blocked if this
+    /// exceeds the ship's `phaser_range`.
+    pub mouse_distance: f32,
     /// Monotonically increasing counter; server ignores inputs with sequence ≤ last seen.
     pub sequence: u32,
 }
