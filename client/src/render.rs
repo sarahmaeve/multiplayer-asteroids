@@ -91,6 +91,59 @@ impl ShipTextures {
     }
 }
 
+// ─── Object textures (planets + asteroids) ────────────────────────────────────
+
+struct ObjectTextures {
+    rocky:     Option<Texture2D>,
+    gas_giant: Option<Texture2D>,
+    ocean:     Option<Texture2D>,
+    lava:      Option<Texture2D>,
+    ice:       Option<Texture2D>,
+    asteroid:  Option<Texture2D>,
+}
+
+impl ObjectTextures {
+    async fn load() -> Self {
+        async fn try_load(path: &str) -> Option<Texture2D> {
+            match load_texture(path).await {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    log::warn!("Could not load texture {path}: {e}");
+                    None
+                }
+            }
+        }
+        ObjectTextures {
+            rocky:     try_load("assets/planets/rocky.png").await,
+            gas_giant: try_load("assets/planets/gas_giant.png").await,
+            ocean:     try_load("assets/planets/ocean.png").await,
+            lava:      try_load("assets/planets/lava.png").await,
+            ice:       try_load("assets/planets/ice.png").await,
+            asteroid:  try_load("assets/asteroids/asteroid.png").await,
+        }
+    }
+
+    fn planet(&self, planet_type: u32) -> Option<&Texture2D> {
+        match planet_type {
+            0 => self.rocky.as_ref(),
+            1 => self.gas_giant.as_ref(),
+            2 => self.ocean.as_ref(),
+            3 => self.lava.as_ref(),
+            _ => self.ice.as_ref(),
+        }
+    }
+}
+
+fn planet_name(planet_type: u32) -> &'static str {
+    match planet_type {
+        0 => "Duronn",
+        1 => "Nabulon",
+        2 => "Aquaris",
+        3 => "Pyraxis",
+        _ => "Glaciera",
+    }
+}
+
 // ─── Local render state ───────────────────────────────────────────────────────
 
 struct RenderState {
@@ -110,6 +163,8 @@ struct RenderState {
     cloak_toggle: bool,
     /// Whether the in-game help overlay is visible (toggled by `H`).
     show_help: bool,
+    /// Whether the mini-map is visible (toggled by `M`, default on).
+    show_minimap: bool,
     /// Server display name received from `ServerInfo` (shown on login screens).
     server_name: String,
     /// Oneshot sender consumed when the player completes the login screen.
@@ -130,6 +185,7 @@ impl Default for RenderState {
             shields_on: true,
             cloak_toggle: false,
             show_help: false,
+            show_minimap: true,
             server_name: "test server".to_string(),
             login_tx: None,
         }
@@ -147,6 +203,7 @@ pub async fn run(
     let mut state = RenderState::default();
     state.login_tx = Some(login_tx);
     let textures = ShipTextures::load().await;
+    let obj_textures = ObjectTextures::load().await;
 
     loop {
         let dt = get_frame_time();
@@ -174,11 +231,11 @@ pub async fn run(
             AppPhase::LoginName { .. }  => draw_login_name(&state),
             AppPhase::LoginShip { .. }  => draw_login_ship(&state),
             AppPhase::Playing           => {
-                draw_game(&state, &textures);
+                draw_game(&state, &textures, &obj_textures);
                 if state.show_help { draw_help_overlay(); }
             }
             AppPhase::DeadChoosing { .. } => {
-                draw_game(&state, &textures);
+                draw_game(&state, &textures, &obj_textures);
                 draw_dead_overlay(&state);
             }
         }
@@ -255,6 +312,9 @@ fn update_phase(
 
         // ── Death / ship re-selection ────────────────────────────────────────
         AppPhase::DeadChoosing { previous_class, mut selected_idx, mut countdown } => {
+            if is_key_pressed(KeyCode::M) {
+                state.show_minimap = !state.show_minimap;
+            }
             if is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::W) {
                 selected_idx = selected_idx.saturating_sub(1);
             }
@@ -349,6 +409,9 @@ fn collect_input(state: &mut RenderState) -> PlayerInput {
     }
     if is_key_pressed(KeyCode::H) {
         state.show_help = !state.show_help;
+    }
+    if is_key_pressed(KeyCode::M) {
+        state.show_minimap = !state.show_minimap;
     }
     // Cloak is a toggle: press C to engage, press C again (or fuel runs out) to disengage.
     if is_key_pressed(KeyCode::C) && state.current_class.can_cloak() {
@@ -688,7 +751,7 @@ fn centered_text(text: &str, cx: f32, y: f32, font_size: f32, color: Color) {
 
 // ─── In-game rendering ────────────────────────────────────────────────────────
 
-fn draw_game(state: &RenderState, textures: &ShipTextures) {
+fn draw_game(state: &RenderState, textures: &ShipTextures, obj_textures: &ObjectTextures) {
     clear_background(BLACK);
 
     let Some(snapshot) = &state.snapshot else {
@@ -707,11 +770,12 @@ fn draw_game(state: &RenderState, textures: &ShipTextures) {
 
     draw_starfield(cam_x, cam_y);
     draw_world_border();
-    draw_entities(state, snapshot, textures);
+    draw_entities(state, snapshot, textures, obj_textures);
 
     set_default_camera();
     draw_hud(state, snapshot);
     draw_scoreboard(state);
+    draw_minimap(state, snapshot);
 }
 
 fn draw_connecting_screen() {
@@ -766,7 +830,7 @@ fn draw_world_border() {
     draw_rectangle_lines(0.0, 0.0, WORLD_WIDTH, WORLD_HEIGHT, 4.0, DARKBLUE);
 }
 
-fn draw_entities(state: &RenderState, snapshot: &GameStateSnapshot, textures: &ShipTextures) {
+fn draw_entities(state: &RenderState, snapshot: &GameStateSnapshot, textures: &ShipTextures, obj_textures: &ObjectTextures) {
     for entity in &snapshot.entities {
         match entity.kind {
             EntityKind::Ship => draw_ship(state, entity, textures),
@@ -789,10 +853,35 @@ fn draw_entities(state: &RenderState, snapshot: &GameStateSnapshot, textures: &S
                 draw_circle(entity.x, entity.y, 14.0, Color::new(1.0, 0.5, 0.0, 0.7));
             }
             EntityKind::Asteroid => {
-                draw_poly_lines(entity.x, entity.y, 6, 22.0, 0.0, 2.0, GRAY);
+                if let Some(tex) = &obj_textures.asteroid {
+                    let draw_size = 44.0; // matches game collision radius of 22
+                    draw_texture_ex(tex, entity.x - draw_size / 2.0, entity.y - draw_size / 2.0,
+                        WHITE, DrawTextureParams { dest_size: Some(vec2(draw_size, draw_size)), ..Default::default() });
+                } else {
+                    draw_poly_lines(entity.x, entity.y, 6, 22.0, 0.0, 2.0, GRAY);
+                }
             }
             EntityKind::Planet => {
-                draw_planet(entity.x, entity.y, entity.vx, entity.vy);
+                let r = if entity.vx > 0.0 { entity.vx } else { 60.0 };
+                let pt = entity.vy as u32;
+                let (cx, cy) = (entity.x, entity.y);
+
+                if let Some(tex) = obj_textures.planet(pt) {
+                    // The PNG body occupies ~67% of the half-sprite; dest_size = r*3
+                    // makes the body appear at exactly game-radius r.
+                    let tex_size = r * 3.0;
+                    draw_texture_ex(tex, cx - tex_size / 2.0, cy - tex_size / 2.0,
+                        WHITE, DrawTextureParams { dest_size: Some(vec2(tex_size, tex_size)), ..Default::default() });
+                } else {
+                    draw_planet(cx, cy, entity.vx, entity.vy);
+                }
+
+                // Planet name label below
+                let name = planet_name(pt);
+                let font_size = 16.0;
+                let tm = measure_text(name, None, font_size as u16, 1.0);
+                draw_text(name, cx - tm.width / 2.0, cy + r + 22.0, font_size,
+                    Color::new(0.85, 0.90, 1.0, 0.90));
             }
         }
     }
@@ -1082,9 +1171,96 @@ fn draw_hud(state: &RenderState, snapshot: &GameStateSnapshot) {
         20.0, screen_height() - 10.0, 12.0, DARKGRAY,
     );
 
-    let hint = "LMB: aim+thrust  T: torpedo  RMB/Shift: phaser  F: shields  C: cloak toggle  WASD: thrust/turn";
+    let hint = "LMB: aim+thrust  T: torpedo  RMB/Shift: phaser  F: shields  C: cloak  M: map  WASD: thrust/turn";
     let hw = measure_text(hint, None, 12, 1.0).width;
     draw_text(hint, screen_width() - hw - 10.0, screen_height() - 10.0, 12.0, DARKGRAY);
+}
+
+// ─── Mini-map ─────────────────────────────────────────────────────────────────
+
+fn planet_minimap_color(planet_type: u32) -> Color {
+    match planet_type {
+        0 => Color::new(0.60, 0.40, 0.20, 1.0), // rocky  — brown
+        1 => Color::new(0.90, 0.60, 0.18, 1.0), // gas giant — gold
+        2 => Color::new(0.18, 0.42, 0.90, 1.0), // ocean  — blue
+        3 => Color::new(0.80, 0.18, 0.06, 1.0), // lava   — red
+        _ => Color::new(0.72, 0.88, 1.00, 1.0), // ice    — pale blue
+    }
+}
+
+fn planet_abbr(planet_type: u32) -> &'static str {
+    match planet_type {
+        0 => "Dur",
+        1 => "Nab",
+        2 => "Aqu",
+        3 => "Pyr",
+        _ => "Gla",
+    }
+}
+
+fn draw_minimap(state: &RenderState, snapshot: &GameStateSnapshot) {
+    if !state.show_minimap {
+        return;
+    }
+
+    // Size: at most 1/6 screen width and 1/2 screen height; keep it square.
+    let map_size = (screen_width() / 6.0).min(screen_height() / 2.0);
+    let pad = 10.0;
+    let map_x = screen_width()  - map_size - pad;
+    let map_y = screen_height() - map_size - pad;
+
+    // ── Background & border ───────────────────────────────────────────────────
+    draw_rectangle(map_x, map_y, map_size, map_size,
+        Color::new(0.02, 0.04, 0.10, 0.72));
+    draw_rectangle_lines(map_x, map_y, map_size, map_size, 1.0,
+        Color::new(0.35, 0.50, 0.65, 0.80));
+
+    // "MAP" header
+    draw_text("MAP", map_x + 4.0, map_y + 10.0, 10.0,
+        Color::new(0.50, 0.60, 0.70, 0.70));
+
+    // ── Coordinate helper: world → screen (minimap) ───────────────────────────
+    let to_map = |wx: f32, wy: f32| -> (f32, f32) {
+        (map_x + (wx / WORLD_WIDTH)  * map_size,
+         map_y + (wy / WORLD_HEIGHT) * map_size)
+    };
+
+    // ── Planets ───────────────────────────────────────────────────────────────
+    for entity in &snapshot.entities {
+        if entity.kind != EntityKind::Planet { continue; }
+        let (mx, my) = to_map(entity.x, entity.y);
+        let pt = entity.vy as u32;
+        draw_circle(mx, my, 5.0, planet_minimap_color(pt));
+
+        let abbr = planet_abbr(pt);
+        let fs = 8.0;
+        let tw = measure_text(abbr, None, fs as u16, 1.0).width;
+        draw_text(abbr, mx - tw / 2.0, my + 5.0 + fs,
+            fs, Color::new(0.80, 0.88, 1.0, 0.88));
+    }
+
+    // ── Ships ─────────────────────────────────────────────────────────────────
+    for entity in &snapshot.entities {
+        if entity.kind != EntityKind::Ship { continue; }
+        let Some(info) = &entity.ship_info else { continue };
+        let (mx, my) = to_map(entity.x, entity.y);
+        let is_me = state.my_player_id == Some(info.player_id);
+        let (symbol, color) = if is_me {
+            ("*", Color::new(0.20, 1.00, 0.20, 1.0))
+        } else {
+            ("?", Color::new(0.90, 0.70, 0.20, 0.90))
+        };
+        let fs = 10.0;
+        let tm = measure_text(symbol, None, fs as u16, 1.0);
+        draw_text(symbol, mx - tm.width / 2.0, my + tm.height / 2.0, fs, color);
+    }
+
+    // ── Toggle hint ───────────────────────────────────────────────────────────
+    let hint = "[M] hide";
+    let hfs = 8.0;
+    let hw = measure_text(hint, None, hfs as u16, 1.0).width;
+    draw_text(hint, map_x + map_size - hw - 3.0, map_y + map_size - 3.0,
+        hfs, Color::new(0.38, 0.42, 0.50, 0.70));
 }
 
 fn draw_scoreboard(state: &RenderState) {
