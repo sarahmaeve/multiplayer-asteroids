@@ -7,6 +7,9 @@ pub type EntityId = u32;
 pub const TICK_RATE_HZ: u64 = 20;
 pub const TICK_DURATION_MS: u64 = 1000 / TICK_RATE_HZ;
 
+/// Duration of the ship-destruction explosion animation in seconds.
+pub const EXPLOSION_LIFETIME: f32 = 0.75;
+
 /// Torus-topology world dimensions (like Netrek).
 pub const WORLD_WIDTH: f32 = 10_000.0;
 pub const WORLD_HEIGHT: f32 = 10_000.0;
@@ -77,8 +80,8 @@ impl ShipClass {
                 thrust_force: 200.0,
                 turn_rate: 3.0,
                 primary_damage: 15.0,
-                primary_fire_rate_hz: 4.0,
-                primary_projectile_speed: 500.0,
+                primary_fire_rate_hz: 8.0,
+                primary_projectile_speed: 333.0,
                 phaser_damage: 20.0,
                 phaser_range: 200.0,
                 phaser_fire_rate_hz: 3.0,
@@ -95,8 +98,8 @@ impl ShipClass {
                 thrust_force: 150.0,
                 turn_rate: 2.2,
                 primary_damage: 25.0,
-                primary_fire_rate_hz: 2.0,
-                primary_projectile_speed: 450.0,
+                primary_fire_rate_hz: 4.0,
+                primary_projectile_speed: 300.0,
                 phaser_damage: 30.0,
                 phaser_range: 250.0,
                 phaser_fire_rate_hz: 2.0,
@@ -113,8 +116,8 @@ impl ShipClass {
                 thrust_force: 110.0,
                 turn_rate: 1.5,
                 primary_damage: 40.0,
-                primary_fire_rate_hz: 1.5,
-                primary_projectile_speed: 400.0,
+                primary_fire_rate_hz: 3.0,
+                primary_projectile_speed: 267.0,
                 phaser_damage: 50.0,
                 phaser_range: 280.0,
                 phaser_fire_rate_hz: 1.5,
@@ -131,8 +134,8 @@ impl ShipClass {
                 thrust_force: 80.0,
                 turn_rate: 0.8,
                 primary_damage: 80.0,
-                primary_fire_rate_hz: 0.8,
-                primary_projectile_speed: 350.0,
+                primary_fire_rate_hz: 1.6,
+                primary_projectile_speed: 233.0,
                 phaser_damage: 90.0,
                 phaser_range: 260.0,
                 phaser_fire_rate_hz: 1.0,
@@ -149,8 +152,8 @@ impl ShipClass {
                 thrust_force: 90.0,
                 turn_rate: 1.0,
                 primary_damage: 20.0,
-                primary_fire_rate_hz: 1.0,
-                primary_projectile_speed: 380.0,
+                primary_fire_rate_hz: 2.0,
+                primary_projectile_speed: 253.0,
                 phaser_damage: 25.0,
                 phaser_range: 240.0,
                 phaser_fire_rate_hz: 1.8,
@@ -193,6 +196,10 @@ pub enum EntityKind {
     Phaser,
     Drone,
     Explosion,
+    /// Short-lived tumbling wreckage spawned when a ship is destroyed.
+    /// `vx`/`vy` carry linear velocity; `angle` is rotation; `damage` carries
+    /// angular velocity (radians/s) — repurposed since debris deals no damage.
+    Debris,
     Asteroid,
     Planet,
 }
@@ -225,4 +232,6 @@ pub struct ShipInfo {
     pub cloaked: bool,
     /// Shields are currently switched on by the player.
     pub shields_on: bool,
+    /// Torpedoes available to fire (0–12).
+    pub torpedo_count: u8,
 }

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::game::{EntityState, PlayerId, ShipClass};
 
 /// Wire-protocol version.  Client and server must match.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Maximum framed message size (1 MiB).
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
@@ -24,6 +24,8 @@ pub enum ClientMessage {
     SelectShip { class: ShipClass },
     /// Request to respawn after death.
     RequestRespawn,
+    /// Player triggered the self-destruct sequence (Ctrl+Q countdown expired).
+    SelfDestruct,
     /// Graceful disconnect.
     Goodbye,
     /// Pre-handshake probe — asks the server for its display name.
@@ -86,6 +88,8 @@ pub enum ServerMessage {
     PlayerDied {
         victim: PlayerId,
         killer: Option<PlayerId>,
+        /// `true` when the player triggered self-destruct (no screen shake on client).
+        self_destruct: bool,
     },
     /// Server-broadcast text message.
     Chat { from: String, message: String },

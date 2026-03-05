@@ -48,6 +48,8 @@ enum AppPhase {
         /// Seconds remaining before auto-respawn with `previous_class`.
         countdown: f32,
     },
+    /// Player triggered self-destruct.  Offers [R] Rejoin / [Q] Quit.
+    SelfDestructed,
 }
 
 // ─── Ship textures ────────────────────────────────────────────────────────────
@@ -165,6 +167,10 @@ struct RenderState {
     show_help: bool,
     /// Whether the mini-map is visible (toggled by `M`, default on).
     show_minimap: bool,
+    /// Remaining seconds on the self-destruct countdown; `None` when not armed.
+    self_destruct_countdown: Option<f32>,
+    /// Remaining screen-shake intensity; decays to zero each frame.
+    screen_shake: f32,
     /// Server display name received from `ServerInfo` (shown on login screens).
     server_name: String,
     /// Oneshot sender consumed when the player completes the login screen.
@@ -186,6 +192,8 @@ impl Default for RenderState {
             cloak_toggle: false,
             show_help: false,
             show_minimap: true,
+            self_destruct_countdown: None,
+            screen_shake: 0.0,
             server_name: "test server".to_string(),
             login_tx: None,
         }
@@ -200,20 +208,25 @@ pub async fn run(
     input_tx: Sender<ClientMessage>,
     login_tx: oneshot::Sender<LoginInfo>,
 ) {
-    let mut state = RenderState::default();
-    state.login_tx = Some(login_tx);
+    let mut state = RenderState { login_tx: Some(login_tx), ..Default::default() };
     let textures = ShipTextures::load().await;
     let obj_textures = ObjectTextures::load().await;
 
     loop {
         let dt = get_frame_time();
 
+        // Decay screen shake every frame.
+        state.screen_shake = (state.screen_shake - 30.0 * dt).max(0.0);
+
         // Always drain server messages so ServerInfo arrives during login and
         // game snapshots are processed while in-game.
         while let Ok(msg) = net_rx.try_recv() {
             handle_server_message(&mut state, msg);
         }
-        if matches!(state.phase, AppPhase::Playing | AppPhase::DeadChoosing { .. }) {
+        if matches!(
+            state.phase,
+            AppPhase::Playing | AppPhase::DeadChoosing { .. } | AppPhase::SelfDestructed
+        ) {
             if let Some(snap) = &state.snapshot {
                 let (cx, cy) = find_camera_target(&state, snap);
                 state.cam_x = cx;
@@ -237,6 +250,10 @@ pub async fn run(
             AppPhase::DeadChoosing { .. } => {
                 draw_game(&state, &textures, &obj_textures);
                 draw_dead_overlay(&state);
+            }
+            AppPhase::SelfDestructed => {
+                draw_game(&state, &textures, &obj_textures);
+                draw_self_destructed_overlay();
             }
         }
 
@@ -287,10 +304,10 @@ fn update_phase(
             if is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::W) {
                 selected_idx = selected_idx.saturating_sub(1);
             }
-            if is_key_pressed(KeyCode::Down) || is_key_pressed(KeyCode::S) {
-                if selected_idx + 1 < ALL_CLASSES.len() {
-                    selected_idx += 1;
-                }
+            if (is_key_pressed(KeyCode::Down) || is_key_pressed(KeyCode::S))
+                && selected_idx + 1 < ALL_CLASSES.len()
+            {
+                selected_idx += 1;
             }
             if is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter) {
                 let class = ALL_CLASSES[selected_idx];
@@ -307,7 +324,37 @@ fn update_phase(
         AppPhase::Playing => {
             let input = collect_input(state);
             input_tx.send(ClientMessage::Input(input)).ok();
+
+            // Tick self-destruct countdown.
+            if let Some(ref mut cd) = state.self_destruct_countdown {
+                *cd -= dt;
+                if *cd <= 0.0 {
+                    state.self_destruct_countdown = None;
+                    input_tx.send(ClientMessage::SelfDestruct).ok();
+                }
+            }
+
             AppPhase::Playing
+        }
+
+        // ── Self-destructed ──────────────────────────────────────────────────
+        AppPhase::SelfDestructed => {
+            if is_key_pressed(KeyCode::R) {
+                // Transition into DeadChoosing so the player can pick a ship.
+                let selected_idx = ALL_CLASSES
+                    .iter()
+                    .position(|&c| c == state.current_class)
+                    .unwrap_or(1);
+                return AppPhase::DeadChoosing {
+                    previous_class: state.current_class,
+                    selected_idx,
+                    countdown: RESPAWN_COUNTDOWN,
+                };
+            }
+            if is_key_pressed(KeyCode::Q) {
+                std::process::exit(0);
+            }
+            AppPhase::SelfDestructed
         }
 
         // ── Death / ship re-selection ────────────────────────────────────────
@@ -318,10 +365,10 @@ fn update_phase(
             if is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::W) {
                 selected_idx = selected_idx.saturating_sub(1);
             }
-            if is_key_pressed(KeyCode::Down) || is_key_pressed(KeyCode::S) {
-                if selected_idx + 1 < ALL_CLASSES.len() {
-                    selected_idx += 1;
-                }
+            if (is_key_pressed(KeyCode::Down) || is_key_pressed(KeyCode::S))
+                && selected_idx + 1 < ALL_CLASSES.len()
+            {
+                selected_idx += 1;
             }
 
             let confirmed = is_key_pressed(KeyCode::Enter)
@@ -376,17 +423,25 @@ fn handle_server_message(state: &mut RenderState, msg: ServerMessage) {
             state.scores = snapshot.scores.clone();
             state.snapshot = Some(snapshot);
         }
-        ServerMessage::PlayerDied { victim, .. } => {
+        ServerMessage::PlayerDied { victim, self_destruct, .. } => {
             if state.my_player_id == Some(victim) {
-                let selected_idx = ALL_CLASSES
-                    .iter()
-                    .position(|&c| c == state.current_class)
-                    .unwrap_or(1);
-                state.phase = AppPhase::DeadChoosing {
-                    previous_class: state.current_class,
-                    selected_idx,
-                    countdown: RESPAWN_COUNTDOWN,
-                };
+                // Clear any pending self-destruct countdown.
+                state.self_destruct_countdown = None;
+                if self_destruct {
+                    // No screen shake; offer Rejoin / Quit.
+                    state.phase = AppPhase::SelfDestructed;
+                } else {
+                    state.screen_shake = 18.0;
+                    let selected_idx = ALL_CLASSES
+                        .iter()
+                        .position(|&c| c == state.current_class)
+                        .unwrap_or(1);
+                    state.phase = AppPhase::DeadChoosing {
+                        previous_class: state.current_class,
+                        selected_idx,
+                        countdown: RESPAWN_COUNTDOWN,
+                    };
+                }
             }
         }
         ServerMessage::ServerInfo { server_name } => {
@@ -416,6 +471,29 @@ fn collect_input(state: &mut RenderState) -> PlayerInput {
     // Cloak is a toggle: press C to engage, press C again (or fuel runs out) to disengage.
     if is_key_pressed(KeyCode::C) && state.current_class.can_cloak() {
         state.cloak_toggle = !state.cloak_toggle;
+    }
+
+    // Ctrl+Q: arm the self-destruct countdown (5 s).
+    if is_key_pressed(KeyCode::Q)
+        && (is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl))
+        && state.self_destruct_countdown.is_none()
+    {
+        state.self_destruct_countdown = Some(5.0);
+    }
+    // Cancel self-destruct on movement key press or left-click.
+    if state.self_destruct_countdown.is_some() {
+        let cancel = is_key_pressed(KeyCode::Up)
+            || is_key_pressed(KeyCode::Down)
+            || is_key_pressed(KeyCode::Left)
+            || is_key_pressed(KeyCode::Right)
+            || is_key_pressed(KeyCode::W)
+            || is_key_pressed(KeyCode::S)
+            || is_key_pressed(KeyCode::A)
+            || is_key_pressed(KeyCode::D)
+            || is_mouse_button_pressed(MouseButton::Left);
+        if cancel {
+            state.self_destruct_countdown = None;
+        }
     }
 
     let (mx, my) = mouse_position();
@@ -558,6 +636,30 @@ fn draw_dead_overlay(state: &RenderState) {
     );
 }
 
+// ─── Self-destruct overlay ────────────────────────────────────────────────────
+
+fn draw_self_destructed_overlay() {
+    draw_rectangle(
+        0.0, 0.0, screen_width(), screen_height(),
+        Color::new(0.0, 0.0, 0.0, 0.78),
+    );
+
+    let cx = screen_width() / 2.0;
+    let cy = screen_height() / 2.0;
+
+    centered_text("SELF DESTRUCT COMPLETE", cx, cy - 50.0, 32.0, RED);
+    centered_text(
+        "[R]  Rejoin battle",
+        cx, cy + 14.0, 20.0,
+        Color::new(0.7, 0.9, 0.7, 1.0),
+    );
+    centered_text(
+        "[Q]  Quit game",
+        cx, cy + 44.0, 20.0,
+        Color::new(0.75, 0.75, 0.75, 1.0),
+    );
+}
+
 // ─── Help overlay ─────────────────────────────────────────────────────────────
 
 fn draw_help_overlay() {
@@ -628,6 +730,7 @@ fn draw_help_overlay() {
     lhead!("SHIP SYSTEMS");
     lrow!("F",             "Toggle shields on / off");
     lrow!("C  (toggle)",   "Cloak on/off  (Scout/Dest/Cruiser)");
+    lrow!("Ctrl+Q",        "Self-destruct (5 s countdown)");
 
     // ── Right column: interface & respawn ────────────────────────────────────
     rhead!("INTERFACE");
@@ -726,6 +829,7 @@ fn draw_ship_list(cx: f32, top_y: f32, selected_idx: usize) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_stat_bar(x: f32, y: f32, w: f32, h: f32, frac: f32, color: Color, label: &str, active: bool) {
     let track_color = Color::new(0.15, 0.15, 0.15, 1.0);
     draw_rectangle(x, y, w, h, track_color);
@@ -761,8 +865,13 @@ fn draw_game(state: &RenderState, textures: &ShipTextures, obj_textures: &Object
 
     let (cam_x, cam_y) = find_camera_target(state, snapshot);
 
+    // Screen shake: offset camera by a time-varying amount that decays to zero.
+    let t = get_time() as f32;
+    let shake_x = (t * 97.0).sin() * state.screen_shake;
+    let shake_y = (t * 83.0).cos() * state.screen_shake;
+
     let camera = Camera2D {
-        target: vec2(cam_x, cam_y),
+        target: vec2(cam_x + shake_x, cam_y + shake_y),
         zoom: vec2(2.0 / screen_width(), 2.0 / screen_height()),
         ..Default::default()
     };
@@ -850,7 +959,35 @@ fn draw_entities(state: &RenderState, snapshot: &GameStateSnapshot, textures: &S
                 draw_circle(entity.x, entity.y, 4.0, ORANGE);
             }
             EntityKind::Explosion => {
-                draw_circle(entity.x, entity.y, 14.0, Color::new(1.0, 0.5, 0.0, 0.7));
+                // vx = original lifetime, vy = remaining lifetime (set by server).
+                // t goes 0→1 as the explosion ages.
+                let orig = entity.vx;
+                let remaining = entity.vy;
+                let t = if orig > 0.0 { (1.0 - remaining / orig).clamp(0.0, 1.0) } else { 1.0 };
+
+                // Expanding ring.
+                let ring_r = 4.0 + t * 22.0;
+                let ring_alpha = (1.0 - t) * 0.9;
+                draw_circle_lines(entity.x, entity.y, ring_r, 1.5,
+                    Color::new(1.0, 0.6, 0.1, ring_alpha));
+
+                // Fading core.
+                let core_r = 7.0 * (1.0 - t).sqrt();
+                let core_alpha = (1.0 - t) * 0.85;
+                draw_circle(entity.x, entity.y, core_r,
+                    Color::new(1.0, 0.4, 0.0, core_alpha));
+            }
+            EntityKind::Debris => {
+                // Draw a short tumbling line segment.  Size varies by entity ID
+                // to give each piece a slightly different look.
+                let len = 3.0 + (entity.id % 4) as f32 * 1.5;
+                let cos_a = entity.angle.cos();
+                let sin_a = entity.angle.sin();
+                draw_line(
+                    entity.x - cos_a * len, entity.y - sin_a * len,
+                    entity.x + cos_a * len, entity.y + sin_a * len,
+                    2.0, Color::new(0.75, 0.45, 0.15, 0.85),
+                );
             }
             EntityKind::Asteroid => {
                 if let Some(tex) = &obj_textures.asteroid {
@@ -1162,8 +1299,40 @@ fn draw_hud(state: &RenderState, snapshot: &GameStateSnapshot) {
             };
             draw_text(cloak_label, bar_x + 80.0, badge_y, 14.0, cloak_color);
         }
+
+        // Torpedo count — 12 small pips, yellow = available, dark = spent.
+        draw_text("TORP", bar_x, 122.0, 14.0, LIGHTGRAY);
+        let pip_w = 8.0;
+        let pip_h = 8.0;
+        let pip_gap = 2.5;
+        let pip_x0 = bar_x + 44.0;
+        let pip_y = 112.0;
+        for i in 0u8..6 {
+            let px = pip_x0 + i as f32 * (pip_w + pip_gap);
+            let color = if i < info.torpedo_count { YELLOW } else { DARKGRAY };
+            draw_rectangle(px, pip_y, pip_w, pip_h, color);
+        }
     } else {
         draw_text("DESTROYED — choose a ship and press R or ENTER", 20.0, 30.0, 18.0, ORANGE);
+    }
+
+    // Self-destruct countdown banner.
+    if let Some(countdown) = state.self_destruct_countdown {
+        let msg = format!("SELF DESTRUCT IN  {:.1} s", countdown.max(0.0));
+        let fs = 18.0;
+        let w = measure_text(&msg, None, fs as u16, 1.0).width;
+        let bx = screen_width() / 2.0 - w / 2.0 - 10.0;
+        let by = screen_height() / 2.0 - 60.0;
+        draw_rectangle(bx, by - 20.0, w + 20.0, 28.0, Color::new(0.5, 0.0, 0.0, 0.75));
+        draw_text(&msg, bx + 10.0, by, fs, RED);
+        let hint2 = "Move or click to cancel";
+        let hw2 = measure_text(hint2, None, 13, 1.0).width;
+        draw_text(
+            hint2,
+            screen_width() / 2.0 - hw2 / 2.0,
+            by + 18.0, 13.0,
+            Color::new(0.9, 0.4, 0.4, 0.9),
+        );
     }
 
     draw_text(
@@ -1171,7 +1340,7 @@ fn draw_hud(state: &RenderState, snapshot: &GameStateSnapshot) {
         20.0, screen_height() - 10.0, 12.0, DARKGRAY,
     );
 
-    let hint = "LMB: aim+thrust  T: torpedo  RMB/Shift: phaser  F: shields  C: cloak  M: map  WASD: thrust/turn";
+    let hint = "LMB: aim+thrust  T: torpedo  RMB/Shift: phaser  F: shields  C: cloak  Ctrl+Q: self-destruct  M: map";
     let hw = measure_text(hint, None, 12, 1.0).width;
     draw_text(hint, screen_width() - hw - 10.0, screen_height() - 10.0, 12.0, DARKGRAY);
 }

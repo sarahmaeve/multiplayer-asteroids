@@ -269,6 +269,12 @@ async fn handle_client_message(
                 .await
                 .ok();
         }
+        ClientMessage::SelfDestruct => {
+            event_tx
+                .send(GameEvent::SelfDestruct(player_id))
+                .await
+                .ok();
+        }
         ClientMessage::Goodbye => return Ok(true),
         ClientMessage::Hello { .. } | ClientMessage::Ping => {
             warn!("Unexpected {msg:?} from player {player_id}");

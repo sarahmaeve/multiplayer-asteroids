@@ -14,8 +14,8 @@ use rand::Rng;
 use tokio::sync::{broadcast, mpsc};
 
 use shared::game::{
-    EntityId, EntityKind, EntityState, PlayerId, ShipClass, ShipInfo, TICK_DURATION_MS,
-    TICK_RATE_HZ, WORLD_HEIGHT, WORLD_WIDTH,
+    EntityId, EntityKind, EntityState, PlayerId, ShipClass, ShipInfo, EXPLOSION_LIFETIME,
+    TICK_DURATION_MS, TICK_RATE_HZ, WORLD_HEIGHT, WORLD_WIDTH,
 };
 use shared::protocol::{GameStateSnapshot, PlayerInput, PlayerScore, ServerMessage};
 
@@ -38,7 +38,12 @@ pub enum GameEvent {
         class: ShipClass,
     },
     RequestRespawn(PlayerId),
+    /// Player triggered the self-destruct countdown on the client side.
+    SelfDestruct(PlayerId),
 }
+
+/// Torpedo detonation radius: ¼ of a Scout's render size (10.0 / 4.0).
+const TORPEDO_RADIUS: f32 = 2.5;
 
 // ─── Server-side entity ───────────────────────────────────────────────────────
 
@@ -55,6 +60,9 @@ struct ServerEntity {
     damage: f32,
     /// Remaining lifetime in seconds; `None` = permanent.
     lifetime: Option<f32>,
+    /// Remaining travel distance in world units; `None` = no distance limit.
+    /// Used by torpedoes instead of time-based lifetime.
+    travel_remaining: Option<f32>,
 }
 
 // ─── Server-side player ───────────────────────────────────────────────────────
@@ -67,7 +75,7 @@ struct ServerPlayer {
     hull: f32,
     shields: f32,
     fuel: f32,
-    /// Cooldown before the next torpedo can be fired.
+    /// Minimum cooldown between torpedo shots (rate-limiter guard against hold-fire).
     fire_cooldown: f32,
     /// Cooldown before the next phaser shot can be fired.
     phaser_cooldown: f32,
@@ -88,6 +96,14 @@ struct ServerPlayer {
     last_input_seq: u32,
     input: PlayerInput,
     msg_tx: mpsc::Sender<ServerMessage>,
+    /// Available torpedoes (0–12).  Replenish at one per 500 ms.
+    torpedo_count: u8,
+    /// Accumulates time (seconds) toward the next torpedo replenishment.
+    torpedo_regen_timer: f32,
+    /// Sticky flag: set to `true` when the client sends `fire_primary = true`.
+    /// Consumed (cleared) once the torpedo is actually launched.  This ensures
+    /// a keypress that arrives between server ticks is not silently lost.
+    pending_torpedo_fire: bool,
 }
 
 // ─── Game state ───────────────────────────────────────────────────────────────
@@ -135,9 +151,59 @@ impl GameState {
                 owner: Some(player_id),
                 damage: 0.0,
                 lifetime: None,
+                travel_remaining: None,
             },
         );
         id
+    }
+
+    fn spawn_explosion(&mut self, x: f32, y: f32) {
+        let id = self.alloc_entity_id();
+        self.entities.insert(
+            id,
+            ServerEntity {
+                id,
+                kind: EntityKind::Explosion,
+                x,
+                y,
+                // vx encodes original lifetime for client animation (t = 1 − vy/vx).
+                // vy is overridden in build_snapshot with the remaining lifetime.
+                vx: EXPLOSION_LIFETIME,
+                vy: 0.0,
+                angle: 0.0,
+                owner: None,
+                damage: 0.0,
+                lifetime: Some(EXPLOSION_LIFETIME),
+                travel_remaining: None,
+            },
+        );
+    }
+
+    /// Spawn 4 debris pieces at `(x, y)` inheriting `(ship_vx, ship_vy)` plus random spread.
+    fn spawn_debris(&mut self, x: f32, y: f32, ship_vx: f32, ship_vy: f32) {
+        let mut rng = rand::thread_rng();
+        for _ in 0..4 {
+            let id = self.alloc_entity_id();
+            let spread_angle = rng.gen_range(0.0..std::f32::consts::TAU);
+            let spread_speed = rng.gen_range(30.0..120.0f32);
+            let spin = rng.gen_range(-3.0..3.0f32);
+            self.entities.insert(
+                id,
+                ServerEntity {
+                    id,
+                    kind: EntityKind::Debris,
+                    x,
+                    y,
+                    vx: ship_vx + spread_angle.cos() * spread_speed,
+                    vy: ship_vy + spread_angle.sin() * spread_speed,
+                    angle: rng.gen_range(0.0..std::f32::consts::TAU),
+                    owner: None,
+                    damage: spin, // repurposed: angular velocity (rad/s)
+                    lifetime: Some(5.0),
+                    travel_remaining: None,
+                },
+            );
+        }
     }
 
     fn spawn_static_objects(&mut self) {
@@ -156,6 +222,7 @@ impl GameState {
                     owner: None,
                     damage: 50.0,
                     lifetime: None,
+                    travel_remaining: None,
                 },
             );
         }
@@ -184,6 +251,7 @@ impl GameState {
                     owner: None,
                     damage: 0.0,
                     lifetime: None,
+                    travel_remaining: None,
                 },
             );
         }
@@ -217,6 +285,9 @@ impl GameState {
                         last_input_seq: 0,
                         input: PlayerInput::default(),
                         msg_tx,
+                        torpedo_count: 6,
+                        torpedo_regen_timer: 0.0,
+                        pending_torpedo_fire: false,
                     },
                 );
             }
@@ -238,6 +309,12 @@ impl GameState {
                     // Reject out-of-order or replayed inputs.
                     if input.sequence > player.last_input_seq {
                         player.last_input_seq = input.sequence;
+                        // Latch fire_primary: once set, stays true until the server
+                        // consumes it.  This prevents the keypress from being lost
+                        // when multiple client frames arrive between server ticks.
+                        if input.fire_primary {
+                            player.pending_torpedo_fire = true;
+                        }
                         player.input = input;
                     }
                 }
@@ -258,6 +335,10 @@ impl GameState {
                         player.respawn_timer = Some(5.0);
                     }
                 }
+            }
+
+            GameEvent::SelfDestruct(id) => {
+                self.self_destruct_player(id);
             }
         }
     }
@@ -291,23 +372,57 @@ impl GameState {
             self.update_player(pid, dt);
         }
 
-        // Projectile movement.
+        // Projectile / debris movement and lifetime ticking.
         for entity in self.entities.values_mut() {
+            // Tick lifetime for any entity that has one.
+            if let Some(lt) = entity.lifetime.as_mut() {
+                *lt -= dt;
+            }
+
             if matches!(entity.kind, EntityKind::Torpedo | EntityKind::Drone) {
-                if let Some(lt) = entity.lifetime.as_mut() {
-                    *lt -= dt;
+                if let Some(tr) = entity.travel_remaining.as_mut() {
+                    let speed = entity.vx.hypot(entity.vy);
+                    *tr -= speed * dt;
                 }
                 entity.x += entity.vx * dt;
                 entity.y += entity.vy * dt;
-                // Projectiles wrap the world too.
                 entity.x = entity.x.rem_euclid(WORLD_WIDTH);
                 entity.y = entity.y.rem_euclid(WORLD_HEIGHT);
+            } else if entity.kind == EntityKind::Debris {
+                entity.x += entity.vx * dt;
+                entity.y += entity.vy * dt;
+                entity.x = entity.x.rem_euclid(WORLD_WIDTH);
+                entity.y = entity.y.rem_euclid(WORLD_HEIGHT);
+                // Spin (angular velocity stored in `damage` field).
+                entity.angle += entity.damage * dt;
+                // Gradual deceleration.
+                let drag = 0.98f32.powf(dt * 20.0);
+                entity.vx *= drag;
+                entity.vy *= drag;
             }
         }
 
-        // Remove expired projectiles.
-        self.entities
-            .retain(|_, e| e.lifetime.map_or(true, |lt| lt > 0.0));
+        // Collect positions of torpedoes that exhausted their travel range
+        // (so we can spawn explosions before removing them).
+        let range_expired: Vec<(f32, f32)> = self
+            .entities
+            .values()
+            .filter(|e| {
+                e.kind == EntityKind::Torpedo
+                    && e.travel_remaining.is_some_and(|tr| tr <= 0.0)
+            })
+            .map(|e| (e.x, e.y))
+            .collect();
+
+        // Remove expired entities (time-based or distance-based).
+        self.entities.retain(|_, e| {
+            e.lifetime.is_none_or(|lt| lt > 0.0)
+                && e.travel_remaining.is_none_or(|tr| tr > 0.0)
+        });
+
+        for (x, y) in range_expired {
+            self.spawn_explosion(x, y);
+        }
 
         self.check_collisions();
         self.check_planet_collisions();
@@ -327,6 +442,9 @@ impl GameState {
             player.shield_regen_cooldown = 0.0;
             player.cloaked = false;
             player.shields_on = true;
+            player.torpedo_count = 6;
+            player.torpedo_regen_timer = 0.0;
+            player.pending_torpedo_fire = false;
         }
     }
 
@@ -454,14 +572,28 @@ impl GameState {
                 p.phaser_cooldown -= dt;
             }
 
+            // Torpedo replenishment: one torpedo per 500 ms while below max.
+            if p.torpedo_count < 6 {
+                p.torpedo_regen_timer += dt;
+                while p.torpedo_regen_timer >= 1.5 {
+                    p.torpedo_regen_timer -= 1.5;
+                    p.torpedo_count = (p.torpedo_count + 1).min(6);
+                }
+            }
+
             // Cloaked ships cannot fire weapons.
             if p.cloaked {
                 (false, false, false)
             } else {
                 let phaser_in_range = input.mouse_distance <= stats.phaser_range;
                 let phaser_active = input.fire_phaser && phaser_in_range;
+                // Torpedo fires from the sticky pending flag (never lost between ticks),
+                // regardless of shield state — requires ammo and minimum cooldown.
+                let want_torpedo = p.pending_torpedo_fire
+                    && p.fire_cooldown <= 0.0
+                    && p.torpedo_count > 0;
                 (
-                    p.fire_cooldown <= 0.0 && input.fire_primary,
+                    want_torpedo,
                     p.phaser_cooldown <= 0.0 && phaser_active && p.fuel > 0.0,
                     phaser_active,
                 )
@@ -510,6 +642,7 @@ impl GameState {
                         owner: Some(pid),
                         damage: 0.0,
                         lifetime: None,
+                        travel_remaining: None,
                     },
                 );
                 self.players.get_mut(&pid).unwrap().phaser_beam_entity = Some(new_id);
@@ -520,7 +653,7 @@ impl GameState {
                 self.players.get_mut(&pid).unwrap().phaser_cooldown =
                     1.0 / stats.phaser_fire_rate_hz;
                 if let Some((victim_id, dmg)) = hit {
-                    self.apply_damage(victim_id, dmg, Some(pid));
+                    self.apply_damage(victim_id, dmg, Some(pid), false);
                 }
             }
         } else {
@@ -533,27 +666,36 @@ impl GameState {
 
         // ── Fire torpedo ─────────────────────────────────────────────────────
         if should_fire_torpedo {
-            self.players.get_mut(&pid).unwrap().fire_cooldown =
-                1.0 / stats.primary_fire_rate_hz;
+            {
+                let p = self.players.get_mut(&pid).unwrap();
+                p.fire_cooldown = 1.0 / stats.primary_fire_rate_hz;
+                p.pending_torpedo_fire = false; // consume the sticky request
+                p.torpedo_count -= 1;
+            }
 
-            let (sx, sy, svx, svy, sangle) = {
+            let (sx, sy, svx, svy) = {
                 let e = self.entities.get(&eid).unwrap();
-                (e.x, e.y, e.vx, e.vy, e.angle)
+                (e.x, e.y, e.vx, e.vy)
             };
+            // Fire toward the mouse cursor angle instead of ship heading.
+            let fire_angle = input.mouse_angle;
             let proj_id = self.alloc_entity_id();
+            // Max travel = 2 × phaser_range × 0.6 (−40 % of base range).
+            let max_travel = 2.0 * stats.phaser_range * 0.6;
             self.entities.insert(
                 proj_id,
                 ServerEntity {
                     id: proj_id,
                     kind: EntityKind::Torpedo,
-                    x: sx + sangle.cos() * 22.0,
-                    y: sy + sangle.sin() * 22.0,
-                    vx: svx + sangle.cos() * stats.primary_projectile_speed,
-                    vy: svy + sangle.sin() * stats.primary_projectile_speed,
-                    angle: sangle,
+                    x: sx + fire_angle.cos() * 22.0,
+                    y: sy + fire_angle.sin() * 22.0,
+                    vx: svx + fire_angle.cos() * stats.primary_projectile_speed,
+                    vy: svy + fire_angle.sin() * stats.primary_projectile_speed,
+                    angle: fire_angle,
                     owner: Some(pid),
                     damage: stats.primary_damage,
-                    lifetime: Some(2.0),
+                    lifetime: None,
+                    travel_remaining: Some(max_travel),
                 },
             );
         }
@@ -629,7 +771,13 @@ impl GameState {
     ///    If that drains fuel to zero, shields are forced off.
     /// 2. Any damage that bypasses shields (excess or shields off/cloaked)
     ///    hits hull directly.
-    fn apply_damage(&mut self, victim_id: PlayerId, dmg: f32, killer_id: Option<PlayerId>) {
+    fn apply_damage(
+        &mut self,
+        victim_id: PlayerId,
+        dmg: f32,
+        killer_id: Option<PlayerId>,
+        self_destruct: bool,
+    ) {
         let shield_cost = self
             .players
             .get(&victim_id)
@@ -637,8 +785,6 @@ impl GameState {
             .unwrap_or(0.0);
 
         let is_dead = if let Some(p) = self.players.get_mut(&victim_id) {
-            // Shields only absorb if they are on, have charge, and the ship
-            // is not cloaked (cloaking suppresses shield protection).
             let shields_active = p.shields_on && !p.cloaked && p.shields > 0.0;
             let shield_absorbed = if shields_active { dmg.min(p.shields) } else { 0.0 };
             let hull_dmg = dmg - shield_absorbed;
@@ -646,12 +792,8 @@ impl GameState {
             if shield_absorbed > 0.0 {
                 p.shields -= shield_absorbed;
                 p.shield_regen_cooldown = 5.0;
-
-                // Each absorbed point drains fuel.
                 let fuel_cost = shield_absorbed * shield_cost;
                 p.fuel = (p.fuel - fuel_cost).max(0.0);
-
-                // Fuel exhausted by this hit — shields drop.
                 if p.fuel == 0.0 {
                     p.shields_on = false;
                 }
@@ -664,31 +806,72 @@ impl GameState {
         };
 
         if is_dead {
-            if let Some(p) = self.players.get_mut(&victim_id) {
-                if let Some(eid) = p.entity_id.take() {
-                    self.entities.remove(&eid);
-                }
-                if let Some(beam_id) = p.phaser_beam_entity.take() {
-                    self.entities.remove(&beam_id);
-                }
-                p.hull = 0.0;
-                p.shields = 0.0;
-                p.deaths += 1;
+            self.kill_player(victim_id, killer_id, self_destruct);
+        }
+    }
+
+    /// Kill a player: remove their ship, spawn effects, and broadcast `PlayerDied`.
+    ///
+    /// `self_destruct = true` skips setting the respawn timer so the client can
+    /// decide when to rejoin.
+    fn kill_player(
+        &mut self,
+        victim_id: PlayerId,
+        killer_id: Option<PlayerId>,
+        self_destruct: bool,
+    ) {
+        // Capture ship position before removing the entity.
+        let (ship_x, ship_y, ship_vx, ship_vy) = self
+            .players
+            .get(&victim_id)
+            .and_then(|p| p.entity_id)
+            .and_then(|eid| self.entities.get(&eid))
+            .map(|e| (e.x, e.y, e.vx, e.vy))
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+
+        if let Some(p) = self.players.get_mut(&victim_id) {
+            if let Some(eid) = p.entity_id.take() {
+                self.entities.remove(&eid);
+            }
+            if let Some(beam_id) = p.phaser_beam_entity.take() {
+                self.entities.remove(&beam_id);
+            }
+            p.hull = 0.0;
+            p.shields = 0.0;
+            p.deaths += 1;
+            // Self-destruct: leave respawn_timer = None so the client triggers it.
+            // Normal death: start the 5-second respawn countdown automatically.
+            if !self_destruct {
                 p.respawn_timer = Some(5.0);
             }
-            if let Some(kid) = killer_id {
-                if let Some(p) = self.players.get_mut(&kid) {
-                    p.kills += 1;
-                }
-            }
-            let death_msg = ServerMessage::PlayerDied {
-                victim: victim_id,
-                killer: killer_id,
-            };
-            for p in self.players.values() {
-                let _ = p.msg_tx.try_send(death_msg.clone());
+        }
+
+        if let Some(kid) = killer_id {
+            if let Some(p) = self.players.get_mut(&kid) {
+                p.kills += 1;
             }
         }
+
+        self.spawn_explosion(ship_x, ship_y);
+        self.spawn_debris(ship_x, ship_y, ship_vx, ship_vy);
+
+        let death_msg = ServerMessage::PlayerDied {
+            victim: victim_id,
+            killer: killer_id,
+            self_destruct,
+        };
+        for p in self.players.values() {
+            let _ = p.msg_tx.try_send(death_msg.clone());
+        }
+    }
+
+    /// Immediately destroy a player's ship as a self-destruct action.
+    fn self_destruct_player(&mut self, pid: PlayerId) {
+        // Only act if the player is alive.
+        if self.players.get(&pid).and_then(|p| p.entity_id).is_none() {
+            return;
+        }
+        self.kill_player(pid, None, true);
     }
 
     // ── Collision detection ───────────────────────────────────────────────────
@@ -696,18 +879,18 @@ impl GameState {
     fn check_collisions(&mut self) {
         /// Collision radius for a ship.
         const SHIP_RADIUS: f32 = 18.0;
-        /// Collision radius for a torpedo.
-        const TORPEDO_RADIUS: f32 = 4.0;
 
         // Snapshot projectile positions (avoid borrow conflict).
-        let projectiles: Vec<(EntityId, f32, f32, Option<PlayerId>, f32)> = self
+        // kind is included so we know whether to spawn an explosion on hit.
+        let projectiles: Vec<(EntityId, EntityKind, f32, f32, Option<PlayerId>, f32)> = self
             .entities
             .values()
             .filter(|e| matches!(e.kind, EntityKind::Torpedo | EntityKind::Drone))
-            .map(|e| (e.id, e.x, e.y, e.owner, e.damage))
+            .map(|e| (e.id, e.kind, e.x, e.y, e.owner, e.damage))
             .collect();
 
-        // Snapshot ship positions.
+        // Snapshot ship positions — includes cloaked ships; server always knows
+        // their positions so torpedoes can hit them.
         let ships: Vec<(EntityId, f32, f32, PlayerId)> = self
             .entities
             .values()
@@ -715,46 +898,50 @@ impl GameState {
             .filter_map(|e| Some((e.id, e.x, e.y, e.owner?)))
             .collect();
 
-        let mut expired_projectiles: Vec<EntityId> = Vec::new();
-        // (victim_player_id, damage, killer_player_id)
-        let mut damage_events: Vec<(PlayerId, f32, Option<PlayerId>)> = Vec::new();
         let mut hit_projectiles: std::collections::HashSet<EntityId> =
             std::collections::HashSet::new();
+        // (projectile_id, detonation_x, detonation_y, is_torpedo)
+        let mut hit_details: Vec<(EntityId, f32, f32, bool)> = Vec::new();
+        // (victim_player_id, damage, killer_player_id)
+        let mut damage_events: Vec<(PlayerId, f32, Option<PlayerId>)> = Vec::new();
 
         let collision_dist_sq =
             (SHIP_RADIUS + TORPEDO_RADIUS) * (SHIP_RADIUS + TORPEDO_RADIUS);
 
-        for (pid, px, py, owner, dmg) in &projectiles {
+        for (pid, pkind, px, py, owner, dmg) in &projectiles {
             if hit_projectiles.contains(pid) {
                 continue;
             }
             for &(_, sx, sy, ship_owner) in &ships {
                 if Some(ship_owner) == *owner {
-                    continue; // can't hit own ship
+                    continue; // own torpedoes never detonate on own ship
                 }
                 let dx = px - sx;
                 let dy = py - sy;
                 if dx * dx + dy * dy < collision_dist_sq {
                     hit_projectiles.insert(*pid);
-                    expired_projectiles.push(*pid);
+                    hit_details.push((*pid, *px, *py, *pkind == EntityKind::Torpedo));
                     damage_events.push((ship_owner, *dmg, *owner));
                     break;
                 }
             }
         }
 
-        for id in expired_projectiles {
+        for (id, x, y, is_torpedo) in hit_details {
             self.entities.remove(&id);
+            if is_torpedo {
+                self.spawn_explosion(x, y);
+            }
         }
 
         for (victim_id, dmg, killer_id) in damage_events {
-            self.apply_damage(victim_id, dmg, killer_id);
+            self.apply_damage(victim_id, dmg, killer_id, false);
         }
     }
 
     // ── Planet collision ──────────────────────────────────────────────────────
 
-    /// Push ships out of planets and apply impact damage.
+    /// Push ships out of planets, apply impact damage, and detonate torpedoes.
     fn check_planet_collisions(&mut self) {
         const SHIP_RADIUS: f32 = 18.0;
         const IMPACT_DAMAGE: f32 = 25.0;
@@ -766,6 +953,32 @@ impl GameState {
             .filter(|e| e.kind == EntityKind::Planet)
             .map(|e| (e.x, e.y, e.vx))
             .collect();
+
+        // ── Torpedo–planet collision ──────────────────────────────────────────
+        let torpedo_ids: Vec<EntityId> = self
+            .entities
+            .values()
+            .filter(|e| e.kind == EntityKind::Torpedo)
+            .map(|e| e.id)
+            .collect();
+
+        let mut torpedoes_to_remove: Vec<(EntityId, f32, f32)> = Vec::new();
+        for tid in torpedo_ids {
+            let Some(te) = self.entities.get(&tid) else { continue };
+            let (tx, ty) = (te.x, te.y);
+            for &(px, py, pradius) in &planets {
+                let dx = tx - px;
+                let dy = ty - py;
+                if (dx * dx + dy * dy).sqrt() < pradius + TORPEDO_RADIUS {
+                    torpedoes_to_remove.push((tid, tx, ty));
+                    break;
+                }
+            }
+        }
+        for (tid, x, y) in torpedoes_to_remove {
+            self.entities.remove(&tid);
+            self.spawn_explosion(x, y);
+        }
 
         // Snapshot ship entity IDs and their owning player IDs.
         let ship_ids: Vec<(EntityId, PlayerId)> = self
@@ -812,7 +1025,7 @@ impl GameState {
         }
 
         for (pid, dmg) in damage_events {
-            self.apply_damage(pid, dmg, None);
+            self.apply_damage(pid, dmg, None, false);
         }
     }
 
@@ -833,6 +1046,7 @@ impl GameState {
                             fuel: p.fuel,
                             cloaked: p.cloaked,
                             shields_on: p.shields_on,
+                            torpedo_count: p.torpedo_count,
                         })
                     })
                 } else {
@@ -844,7 +1058,13 @@ impl GameState {
                     x: e.x,
                     y: e.y,
                     vx: e.vx,
-                    vy: e.vy,
+                    // For Explosion entities: vy carries remaining lifetime so the
+                    // client can compute animation progress as t = 1 − vy/vx.
+                    vy: if e.kind == EntityKind::Explosion {
+                        e.lifetime.unwrap_or(0.0)
+                    } else {
+                        e.vy
+                    },
                     angle: e.angle,
                     ship_info,
                 }
