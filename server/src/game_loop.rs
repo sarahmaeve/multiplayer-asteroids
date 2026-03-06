@@ -531,6 +531,7 @@ impl GameState {
 
         self.check_collisions();
         self.check_planet_collisions();
+        self.check_asteroid_collisions();
     }
 
     fn respawn_player(&mut self, pid: PlayerId) {
@@ -1263,6 +1264,191 @@ impl GameState {
 
         for (pid, dmg) in damage_events {
             self.apply_damage(pid, dmg, None, false);
+        }
+    }
+
+    // ── Asteroid collision ────────────────────────────────────────────────────
+
+    /// Handles asteroid–ship, asteroid–asteroid, and asteroid–planet collisions.
+    fn check_asteroid_collisions(&mut self) {
+        const SHIP_RADIUS: f32 = 18.0;
+        /// Damage the ship takes from hitting an asteroid (half of planet impact).
+        const SHIP_ASTEROID_DAMAGE: f32 = 12.5;
+        /// Damage the asteroid takes from a ship collision.
+        const ASTEROID_SHIP_DAMAGE: f32 = 10.0;
+        /// Speed imparted to the asteroid when a ship hits it.
+        const ASTEROID_NUDGE: f32 = 15.0;
+
+        // Snapshot live asteroid IDs (used across all three checks below).
+        let asteroid_ids: Vec<EntityId> = self
+            .entities
+            .values()
+            .filter(|e| e.kind == EntityKind::Asteroid && e.health.is_some())
+            .map(|e| e.id)
+            .collect();
+
+        // ── Ship–asteroid collisions ──────────────────────────────────────────
+
+        let ship_eids: Vec<(EntityId, PlayerId)> = self
+            .entities
+            .values()
+            .filter(|e| e.kind == EntityKind::Ship)
+            .filter_map(|e| Some((e.id, e.owner?)))
+            .collect();
+
+        // Collect collision responses; apply them after iterating to avoid borrow conflicts.
+        // (ship_eid, pid, asteroid_eid, nx, ny, overlap)
+        let mut ship_hits: Vec<(EntityId, PlayerId, EntityId, f32, f32, f32)> = Vec::new();
+
+        for &(seid, pid) in &ship_eids {
+            let Some(se) = self.entities.get(&seid) else { continue };
+            let (sx, sy) = (se.x, se.y);
+            for &aid in &asteroid_ids {
+                let Some(ae) = self.entities.get(&aid) else { continue };
+                let ar = ae.asteroid_radius.unwrap_or(SMALL_ASTEROID_RADIUS);
+                let min_dist = ar + SHIP_RADIUS;
+                let dx = sx - ae.x;
+                let dy = sy - ae.y;
+                let dist_sq = dx * dx + dy * dy;
+                if dist_sq < min_dist * min_dist {
+                    let dist = dist_sq.sqrt().max(0.001);
+                    ship_hits.push((seid, pid, aid, dx / dist, dy / dist, min_dist - dist));
+                    break; // at most one asteroid hit per ship per tick
+                }
+            }
+        }
+
+        let mut damage_events: Vec<(PlayerId, f32)> = Vec::new();
+        let mut asteroid_damage_events: Vec<(EntityId, f32)> = Vec::new();
+
+        for (seid, pid, aid, nx, ny, push) in &ship_hits {
+            if let Some(se) = self.entities.get_mut(seid) {
+                // Push ship clear of the asteroid surface.
+                se.x = (se.x + nx * push).rem_euclid(WORLD_WIDTH);
+                se.y = (se.y + ny * push).rem_euclid(WORLD_HEIGHT);
+                // Reflect velocity off collision normal and dampen (significant bounce).
+                let dot = se.vx * nx + se.vy * ny;
+                se.vx = (se.vx - 2.0 * dot * nx) * 0.6;
+                se.vy = (se.vy - 2.0 * dot * ny) * 0.6;
+            }
+            if let Some(ae) = self.entities.get_mut(aid) {
+                // Nudge asteroid slightly away from the ship.
+                ae.vx -= nx * ASTEROID_NUDGE;
+                ae.vy -= ny * ASTEROID_NUDGE;
+            }
+            damage_events.push((*pid, SHIP_ASTEROID_DAMAGE));
+            asteroid_damage_events.push((*aid, ASTEROID_SHIP_DAMAGE));
+        }
+
+        for (pid, dmg) in damage_events {
+            self.apply_damage(pid, dmg, None, false);
+        }
+        for (aid, dmg) in asteroid_damage_events {
+            self.apply_asteroid_damage(aid, dmg, None);
+        }
+
+        // ── Asteroid–asteroid collisions ──────────────────────────────────────
+
+        // Snapshot full state for pair-wise checks: (id, x, y, vx, vy, radius)
+        let asteroids: Vec<(EntityId, f32, f32, f32, f32, f32)> = self
+            .entities
+            .values()
+            .filter(|e| e.kind == EntityKind::Asteroid && e.health.is_some())
+            .map(|e| {
+                let r = e.asteroid_radius.unwrap_or(SMALL_ASTEROID_RADIUS);
+                (e.id, e.x, e.y, e.vx, e.vy, r)
+            })
+            .collect();
+
+        // (id1, id2, nx, ny, push1, push2, dvx1, dvy1, dvx2, dvy2)
+        let mut pair_hits: Vec<(EntityId, EntityId, f32, f32, f32, f32, f32, f32, f32, f32)> =
+            Vec::new();
+
+        for i in 0..asteroids.len() {
+            let (id1, x1, y1, vx1, vy1, r1) = asteroids[i];
+            for j in (i + 1)..asteroids.len() {
+                let (id2, x2, y2, vx2, vy2, r2) = asteroids[j];
+                let min_dist = r1 + r2;
+                let dx = x1 - x2;
+                let dy = y1 - y2;
+                let dist_sq = dx * dx + dy * dy;
+                if dist_sq >= min_dist * min_dist {
+                    continue;
+                }
+                let dist = dist_sq.sqrt().max(0.001);
+                let nx = dx / dist; // unit normal from 2 → 1
+                let ny = dy / dist;
+                let overlap = min_dist - dist;
+
+                // Mass proportional to area (radius²).
+                let m1 = r1 * r1;
+                let m2 = r2 * r2;
+                let total_m = m1 + m2;
+
+                // Relative velocity along the normal.
+                let rel_dot = (vx1 - vx2) * nx + (vy1 - vy2) * ny;
+                // Only resolve if approaching each other.
+                if rel_dot >= 0.0 {
+                    continue;
+                }
+                let impulse = 2.0 * rel_dot / total_m;
+                pair_hits.push((
+                    id1,
+                    id2,
+                    nx,
+                    ny,
+                    overlap * m2 / total_m, // push amount for id1
+                    overlap * m1 / total_m, // push amount for id2
+                    -impulse * m2 * nx,     // dvx1
+                    -impulse * m2 * ny,     // dvy1
+                    impulse * m1 * nx,      // dvx2
+                    impulse * m1 * ny,      // dvy2
+                ));
+            }
+        }
+
+        for (id1, id2, nx, ny, push1, push2, dvx1, dvy1, dvx2, dvy2) in &pair_hits {
+            if let Some(e) = self.entities.get_mut(id1) {
+                e.x = (e.x + nx * push1).rem_euclid(WORLD_WIDTH);
+                e.y = (e.y + ny * push1).rem_euclid(WORLD_HEIGHT);
+                e.vx += dvx1;
+                e.vy += dvy1;
+            }
+            if let Some(e) = self.entities.get_mut(id2) {
+                e.x = (e.x - nx * push2).rem_euclid(WORLD_WIDTH);
+                e.y = (e.y - ny * push2).rem_euclid(WORLD_HEIGHT);
+                e.vx += dvx2;
+                e.vy += dvy2;
+            }
+        }
+
+        // ── Asteroid–planet collisions ────────────────────────────────────────
+
+        let planets: Vec<(f32, f32, f32)> = self
+            .entities
+            .values()
+            .filter(|e| e.kind == EntityKind::Planet)
+            .map(|e| (e.x, e.y, e.vx)) // planet radius encoded in vx
+            .collect();
+
+        let mut asteroids_to_destroy: Vec<(EntityId, f32, f32)> = Vec::new();
+
+        for &aid in &asteroid_ids {
+            let Some(ae) = self.entities.get(&aid) else { continue };
+            let ar = ae.asteroid_radius.unwrap_or(SMALL_ASTEROID_RADIUS);
+            for &(px, py, pr) in &planets {
+                let dx = ae.x - px;
+                let dy = ae.y - py;
+                if dx * dx + dy * dy < (pr + ar) * (pr + ar) {
+                    asteroids_to_destroy.push((aid, ae.x, ae.y));
+                    break;
+                }
+            }
+        }
+
+        for (aid, x, y) in asteroids_to_destroy {
+            self.entities.remove(&aid);
+            self.spawn_explosion(x, y);
         }
     }
 

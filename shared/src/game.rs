@@ -83,7 +83,7 @@ impl ShipClass {
                 turn_rate: 3.0,
                 primary_damage: 15.0,
                 primary_fire_rate_hz: 8.0,
-                primary_projectile_speed: 333.0,
+                primary_projectile_speed: 233.0, // 333 * 0.7
                 max_torpedoes: 6,
                 phaser_damage: 20.0,
                 phaser_range: 200.0,
@@ -102,7 +102,7 @@ impl ShipClass {
                 turn_rate: 2.2,
                 primary_damage: 25.0,
                 primary_fire_rate_hz: 4.0,
-                primary_projectile_speed: 300.0,
+                primary_projectile_speed: 210.0, // 300 * 0.7
                 max_torpedoes: 6,
                 phaser_damage: 30.0,
                 phaser_range: 250.0,
@@ -121,7 +121,7 @@ impl ShipClass {
                 turn_rate: 1.5,
                 primary_damage: 40.0,
                 primary_fire_rate_hz: 3.0,
-                primary_projectile_speed: 267.0,
+                primary_projectile_speed: 187.0, // 267 * 0.7
                 max_torpedoes: 6,
                 phaser_damage: 50.0,
                 phaser_range: 280.0,
@@ -140,7 +140,7 @@ impl ShipClass {
                 turn_rate: 0.8,
                 primary_damage: 80.0,
                 primary_fire_rate_hz: 1.6,
-                primary_projectile_speed: 233.0,
+                primary_projectile_speed: 163.0, // 233 * 0.7
                 max_torpedoes: 6,
                 phaser_damage: 90.0,
                 phaser_range: 260.0,
@@ -159,7 +159,7 @@ impl ShipClass {
                 turn_rate: 1.0,
                 primary_damage: 20.0,
                 primary_fire_rate_hz: 2.0,
-                primary_projectile_speed: 253.0,
+                primary_projectile_speed: 177.0, // 253 * 0.7
                 max_torpedoes: 6,
                 phaser_damage: 25.0,
                 phaser_range: 240.0,

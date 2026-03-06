@@ -41,6 +41,15 @@ enum AppPhase {
     },
     /// Connected and playing.
     Playing,
+    /// Ship just destroyed — player watches the debris for a few seconds before
+    /// the next screen appears.
+    DeadWatching {
+        previous_class: ShipClass,
+        /// Seconds remaining before transitioning to the next phase.
+        timer: f32,
+        /// If true, transitions to `SelfDestructed`; otherwise to `DeadChoosing`.
+        self_destruct: bool,
+    },
     /// Dead; showing ship-selection countdown before auto-respawning.
     DeadChoosing {
         previous_class: ShipClass,
@@ -225,7 +234,10 @@ pub async fn run(
         }
         if matches!(
             state.phase,
-            AppPhase::Playing | AppPhase::DeadChoosing { .. } | AppPhase::SelfDestructed
+            AppPhase::Playing
+                | AppPhase::DeadWatching { .. }
+                | AppPhase::DeadChoosing { .. }
+                | AppPhase::SelfDestructed
         ) {
             if let Some(snap) = &state.snapshot {
                 let (cx, cy) = find_camera_target(&state, snap);
@@ -246,6 +258,10 @@ pub async fn run(
             AppPhase::Playing           => {
                 draw_game(&state, &textures, &obj_textures);
                 if state.show_help { draw_help_overlay(); }
+            }
+            AppPhase::DeadWatching { timer, .. } => {
+                draw_game(&state, &textures, &obj_textures);
+                draw_dead_watching_overlay(*timer);
             }
             AppPhase::DeadChoosing { .. } => {
                 draw_game(&state, &textures, &obj_textures);
@@ -357,6 +373,26 @@ fn update_phase(
             AppPhase::SelfDestructed
         }
 
+        // ── Post-death spectate ──────────────────────────────────────────────
+        AppPhase::DeadWatching { previous_class, mut timer, self_destruct } => {
+            timer -= dt;
+            if timer <= 0.0 {
+                if self_destruct {
+                    return AppPhase::SelfDestructed;
+                }
+                let selected_idx = ALL_CLASSES
+                    .iter()
+                    .position(|&c| c == previous_class)
+                    .unwrap_or(1);
+                return AppPhase::DeadChoosing {
+                    previous_class,
+                    selected_idx,
+                    countdown: RESPAWN_COUNTDOWN,
+                };
+            }
+            AppPhase::DeadWatching { previous_class, timer, self_destruct }
+        }
+
         // ── Death / ship re-selection ────────────────────────────────────────
         AppPhase::DeadChoosing { previous_class, mut selected_idx, mut countdown } => {
             if is_key_pressed(KeyCode::M) {
@@ -427,21 +463,14 @@ fn handle_server_message(state: &mut RenderState, msg: ServerMessage) {
             if state.my_player_id == Some(victim) {
                 // Clear any pending self-destruct countdown.
                 state.self_destruct_countdown = None;
-                if self_destruct {
-                    // No screen shake; offer Rejoin / Quit.
-                    state.phase = AppPhase::SelfDestructed;
-                } else {
+                if !self_destruct {
                     state.screen_shake = 18.0;
-                    let selected_idx = ALL_CLASSES
-                        .iter()
-                        .position(|&c| c == state.current_class)
-                        .unwrap_or(1);
-                    state.phase = AppPhase::DeadChoosing {
-                        previous_class: state.current_class,
-                        selected_idx,
-                        countdown: RESPAWN_COUNTDOWN,
-                    };
                 }
+                state.phase = AppPhase::DeadWatching {
+                    previous_class: state.current_class,
+                    timer: 5.0,
+                    self_destruct,
+                };
             }
         }
         ServerMessage::ServerInfo { server_name } => {
@@ -591,6 +620,26 @@ fn draw_login_ship(state: &RenderState) {
     centered_text(
         "↑ / ↓  to navigate    ENTER  to launch",
         cx, cy + 165.0, 14.0, DARKGRAY,
+    );
+}
+
+// ─── Death-watch overlay ──────────────────────────────────────────────────────
+
+/// Minimal overlay shown during the 5-second post-death watch period.
+/// Keeps the game world visible but makes it clear the player is dead.
+fn draw_dead_watching_overlay(timer: f32) {
+    let cx = screen_width() / 2.0;
+
+    // Subtle dark band at the top so text is readable without hiding the action.
+    draw_rectangle(0.0, 0.0, screen_width(), 52.0, Color::new(0.0, 0.0, 0.0, 0.65));
+
+    centered_text("SHIP DESTROYED", cx, 22.0, 26.0, RED);
+    centered_text(
+        &format!("Selection screen in {:.1}s", timer.max(0.0)),
+        cx,
+        42.0,
+        14.0,
+        Color::new(0.75, 0.35, 0.35, 1.0),
     );
 }
 
@@ -900,6 +949,11 @@ fn find_camera_target(state: &RenderState, snapshot: &GameStateSnapshot) -> (f32
             }
         }
     }
+    // Ship not found (dead/spectating): hold the camera at its current position
+    // so the destruction animation plays in-place rather than jumping to world centre.
+    if state.cam_x != 0.0 || state.cam_y != 0.0 {
+        return (state.cam_x, state.cam_y);
+    }
     (WORLD_WIDTH / 2.0, WORLD_HEIGHT / 2.0)
 }
 
@@ -934,7 +988,16 @@ fn draw_entities(state: &RenderState, snapshot: &GameStateSnapshot, textures: &S
         match entity.kind {
             EntityKind::Ship => draw_ship(state, entity, textures),
             EntityKind::Torpedo => {
-                draw_circle(entity.x, entity.y, 3.0, YELLOW);
+                // Shimmer phase is offset per torpedo using the fire angle so
+                // each torpedo pulses independently.
+                let t = get_time() as f32;
+                let shimmer = (t * 10.0 + entity.angle).sin() * 0.5 + 0.5; // 0..1
+                let glow_r = 2.0 + shimmer * 1.5;
+                let glow_alpha = 0.25 + shimmer * 0.45;
+                draw_circle(entity.x, entity.y, glow_r,
+                    Color::new(1.0, 0.1, 0.1, glow_alpha));
+                draw_circle(entity.x, entity.y, 2.0,
+                    Color::new(1.0, 0.35, 0.35, 1.0));
             }
             EntityKind::Phaser => {
                 let beam_len = entity.vx;
