@@ -547,6 +547,7 @@ impl GameState {
             player.phaser_beam_entity = None;
             player.shield_regen_cooldown = 0.0;
             player.cloaked = false;
+            player.input.cloak_active = false;
             player.shields_on = true;
             player.torpedo_count = stats.max_torpedoes;
             player.torpedo_regen_timer = 0.0;

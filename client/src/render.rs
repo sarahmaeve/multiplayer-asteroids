@@ -543,7 +543,7 @@ fn handle_server_message(state: &mut RenderState, msg: ServerMessage) {
                             // exhausted (server dropped the cloak due to empty tank).
                             // Never clear it based on a stale snapshot that arrives
                             // before the server has processed the keypress.
-                            if state.cloak_toggle && info.fuel == 0.0 {
+                            if state.cloak_toggle && info.fuel == 0.0 && state.prev_cloaked {
                                 state.cloak_toggle = false;
                             }
                         }
@@ -1646,7 +1646,11 @@ fn process_sound_events(
             let mut nearest_asteroid = f32::MAX;
             let mut nearest_planet   = f32::MAX;
             for e in &snapshot.entities {
-                let dist = (e.x - me.x).hypot(e.y - me.y);
+                let dx = (e.x - me.x).abs();
+                let dx = dx.min(WORLD_WIDTH - dx);
+                let dy = (e.y - me.y).abs();
+                let dy = dy.min(WORLD_HEIGHT - dy);
+                let dist = dx.hypot(dy);
                 match e.kind {
                     EntityKind::Asteroid => nearest_asteroid = nearest_asteroid.min(dist),
                     EntityKind::Planet   => nearest_planet   = nearest_planet.min(dist),
