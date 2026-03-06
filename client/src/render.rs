@@ -1082,16 +1082,20 @@ fn draw_entities(state: &RenderState, snapshot: &GameStateSnapshot, textures: &S
         match entity.kind {
             EntityKind::Ship => draw_ship(state, entity, textures),
             EntityKind::Torpedo => {
+                // vy carries travel_remaining (encoded by server).
+                // Fade and shrink over the last 60 units of range.
+                const FIZZLE_DIST: f32 = 60.0;
+                let life = (entity.vy / FIZZLE_DIST).clamp(0.0, 1.0);
                 // Shimmer phase is offset per torpedo using the fire angle so
                 // each torpedo pulses independently.
                 let t = get_time() as f32;
                 let shimmer = (t * 10.0 + entity.angle).sin() * 0.5 + 0.5; // 0..1
-                let glow_r = 2.0 + shimmer * 1.5;
-                let glow_alpha = 0.25 + shimmer * 0.45;
+                let glow_r = (2.0 + shimmer * 1.5) * life;
+                let glow_alpha = (0.25 + shimmer * 0.45) * life;
                 draw_circle(entity.x, entity.y, glow_r,
                     Color::new(1.0, 0.1, 0.1, glow_alpha));
-                draw_circle(entity.x, entity.y, 2.0,
-                    Color::new(1.0, 0.35, 0.35, 1.0));
+                draw_circle(entity.x, entity.y, 2.0 * life,
+                    Color::new(1.0, 0.35, 0.35, life));
             }
             EntityKind::Phaser => {
                 let beam_len = entity.vx;

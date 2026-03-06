@@ -497,27 +497,13 @@ impl GameState {
             }
         }
 
-        // Collect positions of torpedoes that exhausted their travel range
-        // (so we can spawn explosions before removing them).
-        let range_expired: Vec<(f32, f32)> = self
-            .entities
-            .values()
-            .filter(|e| {
-                e.kind == EntityKind::Torpedo
-                    && e.travel_remaining.is_some_and(|tr| tr <= 0.0)
-            })
-            .map(|e| (e.x, e.y))
-            .collect();
-
         // Remove expired entities (time-based or distance-based).
+        // Torpedoes that exhaust their travel range are silently removed — no
+        // explosion — so that only direct hits produce a detonation.
         self.entities.retain(|_, e| {
             e.lifetime.is_none_or(|lt| lt > 0.0)
                 && e.travel_remaining.is_none_or(|tr| tr > 0.0)
         });
-
-        for (x, y) in range_expired {
-            self.spawn_explosion(x, y);
-        }
 
         // Replenish big asteroids: spawn one when fewer than 5 remain, up to a cap of 15.
         let big_count = self
@@ -1491,8 +1477,12 @@ impl GameState {
                     },
                     // For Explosion entities: vy carries remaining lifetime so the
                     // client can compute animation progress as t = 1 − vy/vx.
+                    // For Torpedo entities: vy carries travel_remaining so the
+                    // client can fade the torpedo out as it approaches max range.
                     vy: if e.kind == EntityKind::Explosion {
                         e.lifetime.unwrap_or(0.0)
+                    } else if e.kind == EntityKind::Torpedo {
+                        e.travel_remaining.unwrap_or(0.0)
                     } else {
                         e.vy
                     },
