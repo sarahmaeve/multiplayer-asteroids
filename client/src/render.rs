@@ -3,11 +3,13 @@
 //! Runs on the main thread.  Manages the full app lifecycle:
 //! login → ship selection → in-game → death/respawn ship selection → ...
 
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 
+use macroquad::audio::{load_sound, play_sound, PlaySoundParams, Sound};
 use macroquad::prelude::*;
 
-use shared::game::{EntityKind, PlayerId, ShipClass, WORLD_HEIGHT, WORLD_WIDTH};
+use shared::game::{EntityId, EntityKind, PlayerId, ShipClass, WORLD_HEIGHT, WORLD_WIDTH};
 use shared::protocol::{ClientMessage, GameStateSnapshot, PlayerInput, PlayerScore, ServerMessage};
 
 use tokio::sync::oneshot;
@@ -145,6 +147,68 @@ impl ObjectTextures {
     }
 }
 
+// ─── Sounds ───────────────────────────────────────────────────────────────────
+//
+// Place OGG/WAV files in assets/sounds/ with the names below.
+// Missing files are silently skipped — the game runs without them.
+
+struct GameSounds {
+    torpedo_fire:       Option<Sound>,
+    phaser_fire:        Option<Sound>,
+    explosion:          Option<Sound>,
+    debris:             Option<Sound>,
+    ship_asteroid_hit:  Option<Sound>,
+    ship_planet_hit:    Option<Sound>,
+    torpedo_detonation: Option<Sound>,
+    cloak_on:           Option<Sound>,
+    cloak_off:          Option<Sound>,
+    enter_game:         Option<Sound>,
+    shields_low:        Option<Sound>,
+    fuel_low:           Option<Sound>,
+}
+
+impl GameSounds {
+    async fn load() -> Self {
+        async fn try_load(path: &str) -> Option<Sound> {
+            match load_sound(path).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    log::warn!("Could not load sound {path}: {e}");
+                    None
+                }
+            }
+        }
+        GameSounds {
+            torpedo_fire:       try_load("assets/sounds/torpedo_fire.wav").await,
+            phaser_fire:        try_load("assets/sounds/phaser_fire.wav").await,
+            explosion:          try_load("assets/sounds/explosion.wav").await,
+            debris:             try_load("assets/sounds/debris.wav").await,
+            ship_asteroid_hit:  try_load("assets/sounds/ship_asteroid_hit.wav").await,
+            ship_planet_hit:    try_load("assets/sounds/ship_planet_hit.wav").await,
+            torpedo_detonation: try_load("assets/sounds/torpedo_detonation.wav").await,
+            cloak_on:           try_load("assets/sounds/cloak_on.wav").await,
+            cloak_off:          try_load("assets/sounds/cloak_off.wav").await,
+            enter_game:         try_load("assets/sounds/enter_game.wav").await,
+            shields_low:        try_load("assets/sounds/shields_low.wav").await,
+            fuel_low:           try_load("assets/sounds/fuel_low.wav").await,
+        }
+    }
+}
+
+fn play_at_volume(sound: &Option<Sound>, volume: f32) {
+    if let Some(s) = sound {
+        play_sound(s, PlaySoundParams { looped: false, volume: volume.clamp(0.0, 1.0) });
+    }
+}
+
+/// Linear distance attenuation: full volume within 200 units, silent at 3000.
+fn spatial_volume(cam_x: f32, cam_y: f32, ex: f32, ey: f32) -> f32 {
+    let dist = (ex - cam_x).hypot(ey - cam_y);
+    const FULL: f32 = 200.0;
+    const MAX:  f32 = 3000.0;
+    if dist <= FULL { 1.0 } else { (1.0 - (dist - FULL) / (MAX - FULL)).max(0.0) }
+}
+
 fn planet_name(planet_type: u32) -> &'static str {
     match planet_type {
         0 => "Duronn",
@@ -184,6 +248,21 @@ struct RenderState {
     server_name: String,
     /// Oneshot sender consumed when the player completes the login screen.
     login_tx: Option<oneshot::Sender<LoginInfo>>,
+    // ── Sound-event tracking ─────────────────────────────────────────────────
+    /// Entity IDs present in the previous snapshot, for new-entity detection.
+    prev_entity_ids: HashSet<EntityId>,
+    /// Last-known positions of torpedo entities, for detonation detection.
+    prev_torpedo_positions: HashMap<EntityId, (f32, f32)>,
+    /// Local player's `cloaked` state last frame.
+    prev_cloaked: bool,
+    /// Local player's hull last frame (for collision-sound detection).
+    prev_hull: f32,
+    /// True once the shields-low warning has fired; cleared on recovery.
+    shields_low_alerted: bool,
+    /// True once the fuel-low warning has fired; cleared on recovery.
+    fuel_low_alerted: bool,
+    /// Set in `update_phase` when transitioning into `Playing`; consumed by sound tick.
+    just_entered_game: bool,
 }
 
 impl Default for RenderState {
@@ -205,6 +284,13 @@ impl Default for RenderState {
             screen_shake: 0.0,
             server_name: "test server".to_string(),
             login_tx: None,
+            prev_entity_ids: HashSet::new(),
+            prev_torpedo_positions: HashMap::new(),
+            prev_cloaked: false,
+            prev_hull: 0.0,
+            shields_low_alerted: false,
+            fuel_low_alerted: false,
+            just_entered_game: false,
         }
     }
 }
@@ -220,6 +306,7 @@ pub async fn run(
     let mut state = RenderState { login_tx: Some(login_tx), ..Default::default() };
     let textures = ShipTextures::load().await;
     let obj_textures = ObjectTextures::load().await;
+    let sounds = GameSounds::load().await;
 
     loop {
         let dt = get_frame_time();
@@ -250,6 +337,11 @@ pub async fn run(
         // borrows when `update_phase` also needs `&mut RenderState`.
         let phase = std::mem::replace(&mut state.phase, AppPhase::Playing);
         state.phase = update_phase(phase, &mut state, dt, &input_tx);
+
+        // Process sound events (clone snapshot to sidestep borrow conflicts).
+        if let Some(snap) = state.snapshot.clone() {
+            process_sound_events(&mut state, &sounds, &snap);
+        }
 
         // Draw.
         match &state.phase {
@@ -331,6 +423,7 @@ fn update_phase(
                     tx.send(LoginInfo { username: username.clone(), ship_class: class }).ok();
                 }
                 state.current_class = class;
+                state.just_entered_game = true;
                 return AppPhase::Playing;
             }
             AppPhase::LoginShip { username, selected_idx }
@@ -423,6 +516,7 @@ fn update_phase(
                 state.current_class = class;
                 state.shields_on = true;
                 state.cloak_toggle = false;
+                state.just_entered_game = true;
                 return AppPhase::Playing;
             }
 
@@ -1455,6 +1549,154 @@ fn draw_hud(state: &RenderState, snapshot: &GameStateSnapshot) {
     draw_text(hint, screen_width() - hw - 10.0, screen_height() - 10.0, 12.0, DARKGRAY);
 }
 
+// ─── Sound events ─────────────────────────────────────────────────────────────
+
+fn process_sound_events(
+    state: &mut RenderState,
+    sounds: &GameSounds,
+    snapshot: &GameStateSnapshot,
+) {
+    let cam_x = state.cam_x;
+    let cam_y = state.cam_y;
+    let my_id = state.my_player_id;
+
+    // Current entity ID set and torpedo positions for this frame.
+    let curr_ids: HashSet<EntityId> = snapshot.entities.iter().map(|e| e.id).collect();
+    let curr_torpedo_positions: HashMap<EntityId, (f32, f32)> = snapshot
+        .entities.iter()
+        .filter(|e| e.kind == EntityKind::Torpedo)
+        .map(|e| (e.id, (e.x, e.y)))
+        .collect();
+
+    // Find local player's ship once for proximity checks.
+    let my_ship = my_id.and_then(|pid| {
+        snapshot.entities.iter().find(|e| {
+            e.ship_info.as_ref().map_or(false, |i| i.player_id == pid)
+        })
+    });
+
+    // ── New entities this frame ───────────────────────────────────────────────
+    let mut played_debris = false;
+    for entity in &snapshot.entities {
+        if state.prev_entity_ids.contains(&entity.id) {
+            continue; // not new
+        }
+        match entity.kind {
+            EntityKind::Torpedo => {
+                let vol = spatial_volume(cam_x, cam_y, entity.x, entity.y);
+                play_at_volume(&sounds.torpedo_fire, vol);
+            }
+            EntityKind::Phaser => {
+                // Only play for the local player's phaser — it spawns at their ship.
+                let is_mine = my_ship.map_or(false, |me| {
+                    (me.x - entity.x).hypot(me.y - entity.y) < 150.0
+                });
+                if is_mine {
+                    play_at_volume(&sounds.phaser_fire, 1.0);
+                }
+            }
+            EntityKind::Explosion => {
+                let vol = spatial_volume(cam_x, cam_y, entity.x, entity.y);
+                play_at_volume(&sounds.explosion, vol);
+            }
+            EntityKind::Debris => {
+                // Multiple pieces spawn at once; only play one sound per death.
+                if !played_debris {
+                    let vol = spatial_volume(cam_x, cam_y, entity.x, entity.y);
+                    play_at_volume(&sounds.debris, vol);
+                    played_debris = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ── Torpedo detonations ───────────────────────────────────────────────────
+    // A torpedo that vanished this frame and has a new explosion nearby = hit.
+    for (id, (tx, ty)) in &state.prev_torpedo_positions {
+        if curr_ids.contains(id) {
+            continue;
+        }
+        let hit = snapshot.entities.iter().any(|e| {
+            e.kind == EntityKind::Explosion
+                && !state.prev_entity_ids.contains(&e.id)
+                && (e.x - tx).hypot(e.y - ty) < 300.0
+        });
+        if hit {
+            let vol = spatial_volume(cam_x, cam_y, *tx, *ty);
+            play_at_volume(&sounds.torpedo_detonation, vol);
+        }
+    }
+
+    // ── Local-player events ───────────────────────────────────────────────────
+    if let Some(me) = my_ship {
+        let info = me.ship_info.as_ref().unwrap();
+        let stats = info.class.stats();
+
+        // Cloak state change.
+        if info.cloaked && !state.prev_cloaked {
+            play_at_volume(&sounds.cloak_on, 1.0);
+        } else if !info.cloaked && state.prev_cloaked {
+            play_at_volume(&sounds.cloak_off, 1.0);
+        }
+        state.prev_cloaked = info.cloaked;
+
+        // Hull decrease → collision.  Identify asteroid vs planet by proximity.
+        if info.hull < state.prev_hull && state.prev_hull > 0.0 {
+            let mut nearest_asteroid = f32::MAX;
+            let mut nearest_planet   = f32::MAX;
+            for e in &snapshot.entities {
+                let dist = (e.x - me.x).hypot(e.y - me.y);
+                match e.kind {
+                    EntityKind::Asteroid => nearest_asteroid = nearest_asteroid.min(dist),
+                    EntityKind::Planet   => nearest_planet   = nearest_planet.min(dist),
+                    _ => {}
+                }
+            }
+            if nearest_planet < 200.0 && nearest_planet <= nearest_asteroid {
+                play_at_volume(&sounds.ship_planet_hit, 1.0);
+            } else if nearest_asteroid < 500.0 {
+                play_at_volume(&sounds.ship_asteroid_hit, 1.0);
+            }
+        }
+        state.prev_hull = info.hull;
+
+        // Shields below 10% — one-shot alert, resets after recovering to 20%.
+        let shields_pct = info.shields / stats.max_shields;
+        if shields_pct < 0.10 && !state.shields_low_alerted {
+            play_at_volume(&sounds.shields_low, 1.0);
+            state.shields_low_alerted = true;
+        } else if shields_pct >= 0.20 {
+            state.shields_low_alerted = false;
+        }
+
+        // Fuel below 5% — one-shot alert, resets after recovering to 10%.
+        let fuel_pct = info.fuel / stats.fuel_capacity;
+        if fuel_pct < 0.05 && !state.fuel_low_alerted {
+            play_at_volume(&sounds.fuel_low, 1.0);
+            state.fuel_low_alerted = true;
+        } else if fuel_pct >= 0.10 {
+            state.fuel_low_alerted = false;
+        }
+    } else {
+        // No ship in snapshot (dead/spectating) — reset per-ship state.
+        state.prev_cloaked = false;
+        state.prev_hull    = 0.0;
+        state.shields_low_alerted = false;
+        state.fuel_low_alerted    = false;
+    }
+
+    // ── Enter-game sound ──────────────────────────────────────────────────────
+    if state.just_entered_game {
+        play_at_volume(&sounds.enter_game, 1.0);
+        state.just_entered_game = false;
+    }
+
+    // ── Advance tracking state ────────────────────────────────────────────────
+    state.prev_entity_ids       = curr_ids;
+    state.prev_torpedo_positions = curr_torpedo_positions;
+}
+
 // ─── Mini-map ─────────────────────────────────────────────────────────────────
 
 fn planet_minimap_color(planet_type: u32) -> Color {
@@ -1498,16 +1740,44 @@ fn draw_minimap(state: &RenderState, snapshot: &GameStateSnapshot) {
     draw_text("MAP", map_x + 4.0, map_y + 10.0, 10.0,
         Color::new(0.50, 0.60, 0.70, 0.70));
 
-    // ── Coordinate helper: world → screen (minimap) ───────────────────────────
-    let to_map = |wx: f32, wy: f32| -> (f32, f32) {
-        (map_x + (wx / WORLD_WIDTH)  * map_size,
-         map_y + (wy / WORLD_HEIGHT) * map_size)
+    // ── Viewport centre: follow the player, fall back to world centre ─────────
+    let (cx, cy) = {
+        let mut pos = (WORLD_WIDTH / 2.0, WORLD_HEIGHT / 2.0);
+        if let Some(pid) = state.my_player_id {
+            for entity in &snapshot.entities {
+                if let Some(info) = &entity.ship_info {
+                    if info.player_id == pid {
+                        pos = (entity.x, entity.y);
+                        break;
+                    }
+                }
+            }
+        }
+        pos
+    };
+
+    // Show a quarter of the world on each side (half-world total).
+    let view_half = WORLD_WIDTH / 4.0;
+
+    // ── Coordinate helper: world → screen (minimap), torus-aware ─────────────
+    let to_map = |wx: f32, wy: f32| -> Option<(f32, f32)> {
+        let mut dx = wx - cx;
+        let mut dy = wy - cy;
+        if dx >  WORLD_WIDTH  / 2.0 { dx -= WORLD_WIDTH; }
+        if dx < -WORLD_WIDTH  / 2.0 { dx += WORLD_WIDTH; }
+        if dy >  WORLD_HEIGHT / 2.0 { dy -= WORLD_HEIGHT; }
+        if dy < -WORLD_HEIGHT / 2.0 { dy += WORLD_HEIGHT; }
+        if dx.abs() > view_half || dy.abs() > view_half {
+            return None;
+        }
+        Some((map_x + (dx / (view_half * 2.0) + 0.5) * map_size,
+              map_y + (dy / (view_half * 2.0) + 0.5) * map_size))
     };
 
     // ── Planets ───────────────────────────────────────────────────────────────
     for entity in &snapshot.entities {
         if entity.kind != EntityKind::Planet { continue; }
-        let (mx, my) = to_map(entity.x, entity.y);
+        let Some((mx, my)) = to_map(entity.x, entity.y) else { continue };
         let pt = entity.vy as u32;
         draw_circle(mx, my, 5.0, planet_minimap_color(pt));
 
@@ -1522,7 +1792,7 @@ fn draw_minimap(state: &RenderState, snapshot: &GameStateSnapshot) {
     for entity in &snapshot.entities {
         if entity.kind != EntityKind::Asteroid { continue; }
         if entity.vx < 50.0 { continue; } // only big asteroids (radius ~60)
-        let (mx, my) = to_map(entity.x, entity.y);
+        let Some((mx, my)) = to_map(entity.x, entity.y) else { continue };
         let fs = 9.0;
         let tm = measure_text("#", None, fs as u16, 1.0);
         draw_text("#", mx - tm.width / 2.0, my + tm.height / 2.0, fs,
@@ -1533,7 +1803,7 @@ fn draw_minimap(state: &RenderState, snapshot: &GameStateSnapshot) {
     for entity in &snapshot.entities {
         if entity.kind != EntityKind::Ship { continue; }
         let Some(info) = &entity.ship_info else { continue };
-        let (mx, my) = to_map(entity.x, entity.y);
+        let Some((mx, my)) = to_map(entity.x, entity.y) else { continue };
         let is_me = state.my_player_id == Some(info.player_id);
         let (symbol, color) = if is_me {
             ("*", Color::new(0.20, 1.00, 0.20, 1.0))
