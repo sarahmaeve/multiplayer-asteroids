@@ -1181,7 +1181,7 @@ fn draw_entities(state: &RenderState, snapshot: &GameStateSnapshot, textures: &S
     let cursor_wy = my - screen_height() / 2.0 + state.cam_y;
 
     // Crosshair turns red when near an enemy ship or within radius+5 of an asteroid.
-    let cursor_on_target = state.snapshot.as_ref().map_or(false, |snap| {
+    let cursor_on_target = state.snapshot.as_ref().is_some_and(|snap| {
         snap.entities.iter().any(|e| {
             match e.kind {
                 EntityKind::Ship => {
@@ -1205,10 +1205,10 @@ fn draw_entities(state: &RenderState, snapshot: &GameStateSnapshot, textures: &S
     });
 
     // Pulsing square only when the phaser is locked onto a target.
-    let phaser_locked = state.my_player_id.map_or(false, |my_id| {
-        state.snapshot.as_ref().map_or(false, |snap| {
+    let phaser_locked = state.my_player_id.is_some_and(|my_id| {
+        state.snapshot.as_ref().is_some_and(|snap| {
             snap.entities.iter().any(|e| {
-                e.ship_info.as_ref().map_or(false, |si| si.player_id == my_id && si.phaser_locked)
+                e.ship_info.as_ref().is_some_and(|si| si.player_id == my_id && si.phaser_locked)
             })
         })
     });
@@ -1575,7 +1575,7 @@ fn process_sound_events(
     // Find local player's ship once for proximity checks.
     let my_ship = my_id.and_then(|pid| {
         snapshot.entities.iter().find(|e| {
-            e.ship_info.as_ref().map_or(false, |i| i.player_id == pid)
+            e.ship_info.as_ref().is_some_and(|i| i.player_id == pid)
         })
     });
 
@@ -1592,7 +1592,7 @@ fn process_sound_events(
             }
             EntityKind::Phaser => {
                 // Only play for the local player's phaser — it spawns at their ship.
-                let is_mine = my_ship.map_or(false, |me| {
+                let is_mine = my_ship.is_some_and(|me| {
                     (me.x - entity.x).hypot(me.y - entity.y) < 150.0
                 });
                 if is_mine {

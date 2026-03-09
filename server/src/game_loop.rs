@@ -511,7 +511,7 @@ impl GameState {
             .values()
             .filter(|e| e.asteroid_radius == Some(BIG_ASTEROID_RADIUS))
             .count();
-        if big_count < 5 && big_count < 15 {
+        if big_count < 5 {
             self.spawn_big_asteroid();
         }
 
@@ -827,8 +827,7 @@ impl GameState {
             // Fire toward the mouse cursor angle instead of ship heading.
             let fire_angle = input.mouse_angle;
             let proj_id = self.alloc_entity_id();
-            // Max travel = 2 × phaser_range × 0.6 (−40 % of base range).
-            let max_travel = 2.0 * stats.phaser_range * 0.6;
+            let max_travel = 1.5 * stats.phaser_range;
             self.entities.insert(
                 proj_id,
                 ServerEntity {
@@ -1348,13 +1347,12 @@ impl GameState {
             .collect();
 
         // (id1, id2, nx, ny, push1, push2, dvx1, dvy1, dvx2, dvy2)
-        let mut pair_hits: Vec<(EntityId, EntityId, f32, f32, f32, f32, f32, f32, f32, f32)> =
-            Vec::new();
+        type AsteroidHit = (EntityId, EntityId, f32, f32, f32, f32, f32, f32, f32, f32);
+        let mut pair_hits: Vec<AsteroidHit> = Vec::new();
 
         for i in 0..asteroids.len() {
             let (id1, x1, y1, vx1, vy1, r1) = asteroids[i];
-            for j in (i + 1)..asteroids.len() {
-                let (id2, x2, y2, vx2, vy2, r2) = asteroids[j];
+            for &(id2, x2, y2, vx2, vy2, r2) in asteroids.iter().skip(i + 1) {
                 let min_dist = r1 + r2;
                 let dx = x1 - x2;
                 let dy = y1 - y2;
